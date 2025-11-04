@@ -548,7 +548,7 @@ class StreamDataExportConfig(BaseModel):
 class BatchStreamOperation(BaseModel):
     """Batch stream operation request."""
     stream_ids: List[str]
-    operation: str  # start, stop, restart, recover
+    operation: Optional[str]= ""  # start, stop, restart, recover
     
     @validator('stream_ids')
     def validate_stream_ids(cls, v):

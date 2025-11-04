@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set, Tuple, Union
 from uuid import UUID
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -52,6 +52,11 @@ class StreamManager:
     Centralized stream manager with deep workspace integration.
     with better error handling, state management, and monitoring.
     """
+
+    @staticmethod
+    def normalize_stream_id(stream_id: Union[str, UUID]) -> str:
+        """Normalize stream ID to lowercase string for consistent lookup."""
+        return str(stream_id).lower()
 
     def __init__(self):
         # Core dependencies
@@ -131,7 +136,7 @@ class StreamManager:
         logging.info("StreamManager initialized with workspace integration")
 
     # ==================== Context Manager for Safe Operations ====================
-    
+
     @asynccontextmanager
     async def _safe_stream_operation(self, stream_id_str: str, operation: str):
         """
@@ -249,7 +254,7 @@ class StreamManager:
     async def get_workspace_stream_limits(self, workspace_id: UUID) -> Dict[str, int]:
         """
         Get stream limits for a workspace with caching.
-        ENHANCED: Added caching to reduce DB queries.
+        FIXED: Now correctly counts active streams from database instead of memory.
         """
         # Check cache
         cache_key = f"ws_limits_{workspace_id}"
@@ -269,7 +274,7 @@ class StreamManager:
                 SUM(u.count_of_camera) as total_camera_limit,
                 COUNT(DISTINCT u.user_id) as active_members,
                 COUNT(DISTINCT CASE WHEN u.is_subscribed = TRUE OR u.role = 'admin' 
-                      THEN u.user_id END) as subscribed_members
+                    THEN u.user_id END) as subscribed_members
             FROM workspace_members wm
             JOIN users u ON wm.user_id = u.user_id
             WHERE wm.workspace_id = $1 AND u.is_active = TRUE
@@ -281,12 +286,21 @@ class StreamManager:
                 "total_camera_limit": 0,
                 "active_members": 0,
                 "subscribed_members": 0,
+                "current_active": 0,
                 "available_slots": 0
             }
         
-        # Get current active streams (from memory for accuracy)
-        workspace_id_str = str(workspace_id)
-        active_count = len(self.workspace_streams.get(workspace_id_str, set()))
+        # FIXED: Get current active streams from DATABASE, not memory
+        # This ensures accuracy even when streams aren't in memory
+        active_count_query = """
+            SELECT COUNT(*) as count
+            FROM video_stream
+            WHERE workspace_id = $1 AND is_streaming = TRUE
+        """
+        active_result = await self.db_manager.execute_query(
+            active_count_query, (workspace_id,), fetch_one=True
+        )
+        active_count = active_result['count'] if active_result else 0
         
         total_limit = result.get('total_camera_limit', 0) or 0
         
@@ -306,6 +320,16 @@ class StreamManager:
         
         return limits_data
 
+    async def _invalidate_workspace_limits_cache(self, workspace_id: UUID):
+        """
+        Invalidate the limits cache for a workspace.
+        Should be called after any operation that changes active stream counts.
+        """
+        cache_key = f"ws_limits_{workspace_id}"
+        if hasattr(self, '_limits_cache') and cache_key in self._limits_cache:
+            del self._limits_cache[cache_key]
+            logger.debug(f"Invalidated limits cache for workspace {workspace_id}")
+            
     async def can_start_stream_in_workspace(
         self,
         workspace_id: UUID,
@@ -615,6 +639,9 @@ class StreamManager:
                 # Transition to ACTIVE state
                 await self._transition_stream_state(stream_id_str, StreamState.ACTIVE)
                 
+                # ✅ Invalidate workspace limits cache after starting
+                await self._invalidate_workspace_limits_cache(workspace_id)
+
                 # Ensure Qdrant collection
                 asyncio.create_task(self._ensure_collection_for_stream_workspace(workspace_id))
                 
@@ -764,6 +791,10 @@ class StreamManager:
                        last_activity = $1, updated_at = $1 WHERE stream_id = $2""",
                     (now_utc, stream_uuid)
                 )
+
+                # ✅ Invalidate workspace limits cache after stopping
+                if workspace_id:
+                    await self._invalidate_workspace_limits_cache(workspace_id)
                 
                 # Notify workspace members
                 if workspace_id:

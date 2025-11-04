@@ -117,23 +117,6 @@ services:
     #       cpus: '2'
     #       memory: 4G
 
-  # kibana:
-  #   image: docker.elastic.co/kibana/kibana:8.19.6
-  #   container_name: kibana
-  #   restart: always
-  #   environment:
-  #     - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-  #   ports:
-  #     - "5601:5601"
-  #   depends_on:
-  #     elasticsearch:
-  #       condition: service_healthy
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         cpus: '1'
-  #         memory: 2G
-
 networks:
   insighteye_network:
     driver: bridge
