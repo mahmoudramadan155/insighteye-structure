@@ -331,7 +331,8 @@ class QdrantService:
         format: str,
         user_system_role: str,
         user_workspace_role: Optional[str],
-        requesting_username: str
+        requesting_username: str,
+        include_frame: bool
     ) -> Tuple[bytes, str, str]:
         """
         Export workspace data in various formats.

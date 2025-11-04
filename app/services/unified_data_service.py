@@ -498,25 +498,15 @@ class UnifiedDataService:
         include_frame: bool = False
     ) -> Tuple[bytes, str, str]:
         """Export workspace data"""
-        if self.backend_type == "elasticsearch":
-            return await self.backend.export_workspace_data(
-                workspace_id=workspace_id,
-                search_query=search_query,
-                format=format,
-                user_system_role=user_system_role,
-                user_workspace_role=user_workspace_role,
-                requesting_username=requesting_username,
-                include_frame=include_frame
-            )
-        else:
-            return await self.backend.export_workspace_data(
-                workspace_id=workspace_id,
-                search_query=search_query,
-                format=format,
-                user_system_role=user_system_role,
-                user_workspace_role=user_workspace_role,
-                requesting_username=requesting_username
-            )
+        return await self.backend.export_workspace_data(
+            workspace_id=workspace_id,
+            search_query=search_query,
+            format=format,
+            user_system_role=user_system_role,
+            user_workspace_role=user_workspace_role,
+            requesting_username=requesting_username,
+            include_frame=include_frame
+        )
     
     # ========== Metadata Operations ==========
     
@@ -709,38 +699,70 @@ class UnifiedDataService:
     
     async def get_unique_locations(self, **kwargs) -> Dict[str, Any]:
         """Get unique locations (Elasticsearch only)"""
-        if self.backend_type == "elasticsearch":
-            return await self.backend.service.get_unique_locations(**kwargs)
-        else:
-            raise NotImplementedError("This method is only available with Elasticsearch backend")
+        return await self.backend.service.get_unique_locations(**kwargs)
     
     async def get_unique_areas(self, **kwargs) -> Dict[str, Any]:
         """Get unique areas (Elasticsearch only)"""
-        if self.backend_type == "elasticsearch":
-            return await self.backend.service.get_unique_areas(**kwargs)
-        else:
-            raise NotImplementedError("This method is only available with Elasticsearch backend")
+        return await self.backend.service.get_unique_areas(**kwargs)
     
     async def get_unique_buildings(self, **kwargs) -> Dict[str, Any]:
         """Get unique buildings (Elasticsearch only)"""
-        if self.backend_type == "elasticsearch":
-            return await self.backend.service.get_unique_buildings(**kwargs)
-        else:
-            raise NotImplementedError("This method is only available with Elasticsearch backend")
+        return await self.backend.service.get_unique_buildings(**kwargs)
     
     async def get_unique_floor_levels(self, **kwargs) -> Dict[str, Any]:
         """Get unique floor levels (Elasticsearch only)"""
-        if self.backend_type == "elasticsearch":
-            return await self.backend.service.get_unique_floor_levels(**kwargs)
-        else:
-            raise NotImplementedError("This method is only available with Elasticsearch backend")
+        return await self.backend.service.get_unique_floor_levels(**kwargs)
     
     async def get_unique_zones(self, **kwargs) -> Dict[str, Any]:
         """Get unique zones (Elasticsearch only)"""
+        return await self.backend.service.get_unique_zones(**kwargs)
+    
+    async def get_workspace_cameras(self, **kwargs) -> Dict[str, Any]:
+        """Get workspace cameras with filtering"""
+        return await self.backend.service.get_workspace_cameras(**kwargs)
+    
+    # ========== Collection/Index Management ==========
+    
+    async def create_collection_or_index(
+        self,
+        name: str,
+        **kwargs
+    ) -> Dict[str, str]:
+        """Create collection (Qdrant) or index (Elasticsearch)"""
         if self.backend_type == "elasticsearch":
-            return await self.backend.service.get_unique_zones(**kwargs)
+            mappings = kwargs.get('mappings')
+            return await self.backend.service.create_index(
+                index_name=name,
+                mappings=mappings
+            )
         else:
-            raise NotImplementedError("This method is only available with Elasticsearch backend")
+            vector_size = kwargs.get('vector_size', config.get("qdrant_vector_size", 1))
+            distance = kwargs.get('distance', 'DOT')
+            return await self.backend.service.create_collection(
+                collection_name=name,
+                vector_size=vector_size,
+                distance=distance
+            )
+    
+    async def delete_collection_or_index(self, name: str) -> Dict[str, str]:
+        """Delete collection (Qdrant) or index (Elasticsearch)"""
+        if self.backend_type == "elasticsearch":
+            return await self.backend.service.delete_index(index_name=name)
+        else:
+            return await self.backend.service.delete_collection(collection_name=name)
+    
+    async def get_total_count(self, name: str) -> int:
+        """Get total count without filters"""
+        if self.backend_type == "elasticsearch":
+            return await self.backend.service.get_index_total_count(index_name=name)
+        else:
+            return await self.backend.service.get_collection_total_count(collection_name=name)
+    
+    # ========== Table/Schema Management ==========
+    
+    async def ensure_fire_detection_state_table(self):
+        """Ensure fire detection state table exists"""
+        return await self.backend.service.ensure_fire_detection_state_table()
     
     # ========== Lifecycle Methods ==========
     
