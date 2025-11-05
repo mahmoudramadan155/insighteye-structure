@@ -6,22 +6,18 @@ from uuid import UUID
 from datetime import datetime, timezone
 import time
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends, Response, Query, status
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketState
 import cv2
 import numpy as np
 
-from app.services.stream_service_3 import stream_manager, send_ping, _safe_close_websocket
+from app.utils import safe_close_websocket, send_ping, handle_mark_read_message
+from app.services.stream_service_3 import stream_manager
 from app.services.session_service import session_manager 
 from app.services.workspace_service import workspace_service
-from app.services.video_stream_service import video_stream_service
 from app.schemas import (
     StreamStartRequest,
     StreamStopRequest,
-    StreamStatusResponse,
-    WorkspaceStreamAnalytics,
-    SystemDiagnostics,
     BatchStreamOperation
 )
 
@@ -196,6 +192,167 @@ async def list_user_streams(
 
 
 # ==================== Workspace Stream Management ====================
+
+@router.post("/workspace/{workspace_id}/start-all")
+async def start_all_workspace_streams(
+    workspace_id: str,
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Start all inactive streams in a workspace.
+    
+    Requires workspace admin role.
+    Respects workspace quota limits and will start streams up to available capacity.
+    """
+    try:
+        user_id = str(current_user["user_id"])
+        ws_id = UUID(workspace_id)
+        
+        # Validate admin access
+        membership = await workspace_service.check_workspace_membership_and_get_role(
+            user_id=user_id,
+            workspace_id=ws_id,
+            required_role="admin"
+        )
+        
+        # Check workspace limits first
+        limits = await stream_manager.get_workspace_stream_limits(ws_id)
+        
+        if limits['available_slots'] <= 0:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "success": False,
+                    "message": f"Workspace at capacity ({limits['current_active']}/{limits['total_camera_limit']})",
+                    "data": {
+                        "started_count": 0,
+                        "total_count": 0,
+                        "skipped_quota": 0,
+                        "failed_streams": [],
+                        "limits": limits
+                    }
+                }
+            )
+        
+        # Get ALL streams from database that are NOT currently streaming
+        streams_query = """
+            SELECT vs.stream_id, vs.name, vs.is_streaming, vs.status, vs.user_id,
+                   u.is_active as user_active, u.is_subscribed, u.role as user_role
+            FROM video_stream vs
+            JOIN users u ON vs.user_id = u.user_id
+            WHERE vs.workspace_id = $1 
+                AND vs.is_streaming = FALSE
+                AND u.is_active = TRUE
+                AND (u.is_subscribed = TRUE OR u.role = 'admin')
+            ORDER BY vs.created_at ASC
+        """
+        db_streams = await stream_manager.db_manager.execute_query(
+            streams_query, (ws_id,), fetch_all=True
+        )
+        
+        if not db_streams:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "success": True,
+                    "message": "No inactive streams to start",
+                    "data": {
+                        "started_count": 0,
+                        "total_count": 0,
+                        "skipped_quota": 0,
+                        "failed_streams": []
+                    }
+                }
+            )
+        
+        # Start streams up to available quota
+        started_count = 0
+        skipped_quota = 0
+        failed_streams = []
+        available_slots = limits['available_slots']
+        
+        for stream in db_streams:
+            stream_id = stream['stream_id']
+            stream_name = stream['name']
+            stream_user_id = stream['user_id']
+            
+            # Check if we've reached workspace capacity
+            if started_count >= available_slots:
+                skipped_quota += 1
+                logger.debug(f"Skipping stream {stream_id} due to workspace quota")
+                continue
+            
+            try:
+                # Validate user can start stream (check personal limits)
+                can_start, reason = await stream_manager.can_start_stream_in_workspace(
+                    ws_id, stream_user_id
+                )
+                
+                if not can_start:
+                    logger.warning(f"Cannot start stream {stream_id}: {reason}")
+                    failed_streams.append({
+                        'stream_id': str(stream_id),
+                        'camera_name': stream_name,
+                        'error': reason
+                    })
+                    continue
+                
+                # Start the stream
+                await stream_manager.start_stream_in_workspace(
+                    stream_id=stream_id,
+                    requester_user_id=UUID(user_id)
+                )
+                started_count += 1
+                logger.info(f"Started stream {stream_id} ({stream_name}) in workspace {workspace_id}")
+                
+                # Small delay to avoid overwhelming the system
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Failed to start stream {stream_id}: {e}")
+                failed_streams.append({
+                    'stream_id': str(stream_id),
+                    'camera_name': stream_name,
+                    'error': str(e)
+                })
+        
+        # FIXED: Invalidate the cache after starting streams
+        # This ensures the next /limits call gets fresh data
+        cache_key = f"ws_limits_{ws_id}"
+        if hasattr(stream_manager, '_limits_cache') and cache_key in stream_manager._limits_cache:
+            del stream_manager._limits_cache[cache_key]
+            logger.debug(f"Invalidated limits cache for workspace {workspace_id}")
+        
+        # Calculate remaining quota after this operation
+        remaining_slots = available_slots - started_count
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "message": f"Started {started_count}/{len(db_streams)} streams",
+                "data": {
+                    "started_count": started_count,
+                    "total_count": len(db_streams),
+                    "skipped_quota": skipped_quota,
+                    "failed_streams": failed_streams,
+                    "limits": {
+                        **limits,
+                        "remaining_after_operation": remaining_slots
+                    }
+                }
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting workspace streams: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start workspace streams: {str(e)}"
+        )
+
 
 @router.post("/workspace/{workspace_id}/stop-all")
 async def stop_all_workspace_streams(
@@ -409,7 +566,7 @@ async def stream_websocket(
                 pass
         
         await stream_manager.disconnect_client(stream_id, websocket)
-        await _safe_close_websocket(websocket)
+        await safe_close_websocket(websocket)
 
 
 @router.websocket("/ws/notifications")
@@ -493,7 +650,7 @@ async def notifications_websocket(websocket: WebSocket):
         if user_id_str:
             await stream_manager.unsubscribe_from_notifications(user_id_str, websocket)
         
-        await _safe_close_websocket(websocket)
+        await safe_close_websocket(websocket)
 
 # ==================== Batch Operations ====================
 
@@ -608,73 +765,4 @@ async def batch_stop_streams(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Batch stop failed: {str(e)}"
-        )
-
-
-# ==================== Shared Stream Management ====================
-
-@router.get("/shared/info")
-async def get_shared_streams_info(
-    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """
-    Get information about all shared video streams.
-    
-    Shows which streams are sharing video sources.
-    """
-    try:
-        # Check admin role
-        if current_user.get("role") != "admin":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin access required"
-            )
-        
-        # Get shared stream stats
-        stats = stream_manager.video_file_manager.get_all_stats()
-        
-        shared_streams = []
-        total_subscribers = 0
-        
-        for source, stream_stats in stats.items():
-            subscribers = []
-            for sub_id, sub_info in stream_stats.get('subscribers', {}).items():
-                subscribers.append({
-                    "stream_id": sub_id,
-                    "frames_received": sub_info.get('frames_received', 0),
-                    "last_frame_time": sub_info.get('last_frame_time')
-                })
-                total_subscribers += 1
-            
-            shared_streams.append({
-                "source": source,
-                "subscriber_count": stream_stats.get('subscriber_count', 0),
-                "is_running": stream_stats.get('is_running', False),
-                "frame_count": stream_stats.get('frame_count', 0),
-                "last_frame_time": stream_stats.get('last_frame_time'),
-                "reconnect_attempts": stream_stats.get('reconnect_attempts', 0),
-                "last_error": stream_stats.get('last_error'),
-                "error_count": stream_stats.get('error_count', 0),
-                "subscribers": subscribers
-            })
-        
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "success": True,
-                "data": {
-                    "shared_streams": shared_streams,
-                    "total_sources": len(shared_streams),
-                    "total_subscribers": total_subscribers
-                }
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting shared streams info: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get shared streams info: {str(e)}"
         )

@@ -507,7 +507,8 @@ class UserManager:
             # Step 5: Delete from Qdrant collections (if qdrant_service available)
             if camera_workspace_mapping:
                 try:
-                    from app.services.qdrant_service import qdrant_service
+                    # from app.services.qdrant_service import qdrant_service  
+                    from app.services.unified_data_service import unified_data_service as qdrant_service
                     qdrant_result = await qdrant_service.delete_user_camera_data(camera_workspace_mapping)
                     deletion_results["qdrant_deletion"] = qdrant_result
                 except Exception as qdrant_err:

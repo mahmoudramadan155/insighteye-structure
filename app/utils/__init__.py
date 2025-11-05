@@ -105,6 +105,13 @@ from app.utils.error_utils import (
     handle_db_errors
 )
 
+# stream utilities
+from app.utils.stream_utils import (
+    safe_close_websocket,
+    send_ping,
+    handle_mark_read_message,
+    send_ping_with_stability_check
+)
 
 __all__ = [
     # Qdrant
@@ -179,4 +186,11 @@ __all__ = [
     
     # error
     'handle_db_errors',
+
+    # stream
+    'safe_close_websocket',
+    'send_ping',
+    'handle_mark_read_message',
+    'send_ping_with_stability_check',
+    
 ]

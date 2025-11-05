@@ -18,7 +18,8 @@ from app.services.people_count_service import people_count_service
 from app.services.notification_service import notification_service
 from app.services.video_stream_service import video_stream_service
 from app.services.parameter_service import parameter_service
-from app.services.qdrant_service import qdrant_service
+# from app.services.qdrant_service import qdrant_service  
+from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.workspace_service import workspace_service
 from app.services.shared_stream_service import video_file_manager
 from app.services.stream_processing_service import stream_processing_service
@@ -37,11 +38,6 @@ class StreamState(Enum):
     INACTIVE = "inactive"
 
 
-class StreamTransitionError(Exception):
-    """Raised when invalid state transition is attempted."""
-    pass
-
-
 class WorkspaceQuotaExceeded(Exception):
     """Raised when workspace stream quota is exceeded."""
     pass
@@ -52,12 +48,6 @@ class StreamManager:
     Centralized stream manager with deep workspace integration.
     with better error handling, state management, and monitoring.
     """
-
-    @staticmethod
-    def normalize_stream_id(stream_id: Union[str, UUID]) -> str:
-        """Normalize stream ID to lowercase string for consistent lookup."""
-        return str(stream_id).lower()
-
     def __init__(self):
         # Core dependencies
         self.db_manager = db_manager
@@ -256,18 +246,6 @@ class StreamManager:
         Get stream limits for a workspace with caching.
         FIXED: Now correctly counts active streams from database instead of memory.
         """
-        # Check cache
-        cache_key = f"ws_limits_{workspace_id}"
-        cache_ttl = 60  # 60 seconds
-        
-        # Simple in-memory cache (consider Redis for production)
-        if not hasattr(self, '_limits_cache'):
-            self._limits_cache = {}
-        
-        cached = self._limits_cache.get(cache_key)
-        if cached and (time.time() - cached['timestamp']) < cache_ttl:
-            return cached['data']
-        
         # Fetch from database
         query = """
             SELECT 
@@ -312,24 +290,8 @@ class StreamManager:
             "available_slots": max(0, total_limit - active_count)
         }
         
-        # Update cache
-        self._limits_cache[cache_key] = {
-            'timestamp': time.time(),
-            'data': limits_data
-        }
-        
         return limits_data
 
-    async def _invalidate_workspace_limits_cache(self, workspace_id: UUID):
-        """
-        Invalidate the limits cache for a workspace.
-        Should be called after any operation that changes active stream counts.
-        """
-        cache_key = f"ws_limits_{workspace_id}"
-        if hasattr(self, '_limits_cache') and cache_key in self._limits_cache:
-            del self._limits_cache[cache_key]
-            logger.debug(f"Invalidated limits cache for workspace {workspace_id}")
-            
     async def can_start_stream_in_workspace(
         self,
         workspace_id: UUID,
@@ -639,9 +601,6 @@ class StreamManager:
                 # Transition to ACTIVE state
                 await self._transition_stream_state(stream_id_str, StreamState.ACTIVE)
                 
-                # ✅ Invalidate workspace limits cache after starting
-                await self._invalidate_workspace_limits_cache(workspace_id)
-
                 # Ensure Qdrant collection
                 asyncio.create_task(self._ensure_collection_for_stream_workspace(workspace_id))
                 
@@ -791,10 +750,6 @@ class StreamManager:
                        last_activity = $1, updated_at = $1 WHERE stream_id = $2""",
                     (now_utc, stream_uuid)
                 )
-
-                # ✅ Invalidate workspace limits cache after stopping
-                if workspace_id:
-                    await self._invalidate_workspace_limits_cache(workspace_id)
                 
                 # Notify workspace members
                 if workspace_id:
@@ -1073,7 +1028,6 @@ class StreamManager:
                     'shared_sources': len(self._shared_stream_registry),
                     'notification_subscribers': sum(len(ws) for ws in self.notification_subscribers.values()),
                     'error_records': sum(len(errors) for errors in self.stream_errors.values()),
-                    'cache_entries': len(getattr(self, '_limits_cache', {})),
                     'performance': {
                         'total_started': self.metrics['total_streams_started'],
                         'total_stopped': self.metrics['total_streams_stopped'],
@@ -1090,19 +1044,6 @@ class StreamManager:
                 
                 if metrics['error_records'] > 100:
                     logger.warning(f"⚠️ High error count: {metrics['error_records']} records")
-                
-                # Clean up old cache entries
-                if hasattr(self, '_limits_cache'):
-                    current_time = time.time()
-                    expired = [
-                        k for k, v in self._limits_cache.items()
-                        if (current_time - v['timestamp']) > 300  # 5 minutes
-                    ]
-                    for key in expired:
-                        del self._limits_cache[key]
-                    
-                    if expired:
-                        logger.debug(f"Cleaned up {len(expired)} expired cache entries")
                 
             except asyncio.CancelledError:
                 logging.info("Resource monitor task cancelled")
@@ -1760,137 +1701,6 @@ class StreamManager:
         self.cleanup_task = None
         self.monitor_task = None
 
-    # ==================== Diagnostics & Monitoring ====================
-
-    async def get_system_diagnostics(self) -> Dict[str, Any]:
-        """
-        Get comprehensive system diagnostics with workspace breakdown.
-        ENHANCED: Added performance metrics and error analysis.
-        """
-        # Video sharing stats
-        sharing_stats = self.video_file_manager.get_all_stats()
-        
-        # Workspace breakdown
-        workspace_breakdown = []
-        for workspace_id_str in list(self.workspace_streams.keys()):
-            try:
-                workspace_id = UUID(workspace_id_str)
-                analytics = await self.get_workspace_stream_analytics(workspace_id)
-                workspace_breakdown.append(analytics)
-            except Exception as e:
-                logger.error(f"Error getting analytics for workspace {workspace_id_str}: {e}")
-        
-        # System totals
-        total_streams = sum(ws['streams']['total'] for ws in workspace_breakdown)
-        total_streaming = sum(ws['streams']['streaming_now'] for ws in workspace_breakdown)
-        total_errors = sum(ws['performance']['recent_errors'] for ws in workspace_breakdown)
-        
-        # State distribution
-        state_distribution = defaultdict(int)
-        for stream_id, state in self.stream_states.items():
-            state_distribution[state.value] += 1
-        
-        return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "system": {
-                "total_workspaces": len(workspace_breakdown),
-                "total_streams": total_streams,
-                "total_streaming": total_streaming,
-                "total_shared_sources": len(sharing_stats),
-                "active_shared_sources": sum(
-                    1 for s in sharing_stats.values() if s['is_running']
-                ),
-                "total_errors": total_errors,
-                "state_distribution": dict(state_distribution)
-            },
-            "performance": {
-                "total_started": self.metrics['total_streams_started'],
-                "total_stopped": self.metrics['total_streams_stopped'],
-                "total_errors": self.metrics['total_errors'],
-                "avg_duration": self.metrics['avg_stream_duration'],
-                "uptime": (datetime.now(timezone.utc) - self.metrics['last_reset']).total_seconds()
-            },
-            "workspaces": workspace_breakdown,
-            "sharing_stats": sharing_stats,
-            "memory_state": {
-                "active_streams_count": len(self.active_streams),
-                "workspace_registrations": len(self.workspace_streams),
-                "notification_subscribers": len(self.notification_subscribers),
-                "shared_registry_size": len(self._shared_stream_registry),
-                "cache_size": len(getattr(self, '_limits_cache', {}))
-            },
-            "health": {
-                "last_healthcheck": self.last_healthcheck.isoformat(),
-                "healthcheck_interval": self.healthcheck_interval
-            }
-        }
-
-    async def get_stream_diagnostics(self, stream_id: str) -> Dict[str, Any]:
-        """
-        Get detailed diagnostics for a specific stream.
-        NEW: Provides deep insights into stream health.
-        """
-        async with self._lock:
-            stream_info = self.active_streams.get(stream_id)
-        
-        if not stream_info:
-            return {
-                "stream_id": stream_id,
-                "status": "not_active",
-                "message": "Stream not found in active streams"
-            }
-        
-        stats = self.stream_processing_stats.get(stream_id, {})
-        state = self.stream_states.get(stream_id, StreamState.INACTIVE)
-        errors = self.stream_errors.get(stream_id, [])
-        
-        # Calculate uptime
-        start_time = stream_info.get('start_time')
-        uptime_seconds = 0
-        if start_time:
-            uptime_seconds = (datetime.now(timezone.utc) - start_time).total_seconds()
-        
-        # Frame rate
-        frames_processed = stats.get('frames_processed', 0)
-        fps = frames_processed / uptime_seconds if uptime_seconds > 0 else 0
-        
-        return {
-            "stream_id": stream_id,
-            "status": "active",
-            "state": state.value,
-            "camera_name": stream_info.get('camera_name'),
-            "workspace_id": str(stream_info.get('workspace_id')),
-            "owner": stream_info.get('username'),
-            "source": stream_info.get('source'),
-            "timing": {
-                "start_time": start_time.isoformat() if start_time else None,
-                "last_frame_time": stream_info.get('last_frame_time').isoformat() 
-                    if stream_info.get('last_frame_time') else None,
-                "uptime_seconds": uptime_seconds,
-                "uptime_formatted": f"{int(uptime_seconds // 3600)}h {int((uptime_seconds % 3600) // 60)}m"
-            },
-            "performance": {
-                "frames_processed": frames_processed,
-                "detection_count": stats.get('detection_count', 0),
-                "avg_processing_time": stats.get('avg_processing_time', 0),
-                "fps": round(fps, 2),
-                "errors": stats.get('errors', 0)
-            },
-            "clients": {
-                "count": len(stream_info.get('clients', set())),
-                "connected": True
-            },
-            "recent_errors": [
-                {
-                    "timestamp": err['timestamp'].isoformat(),
-                    "operation": err['operation'],
-                    "error": err['error']
-                }
-                for err in errors[-5:]  # Last 5 errors
-            ],
-            "task_status": "running" if stream_info.get('task') and not stream_info['task'].done() else "stopped"
-        }
-
     async def _ensure_collection_for_stream_workspace(self, workspace_id: UUID):
         """Ensure Qdrant collection exists for workspace."""
         try:
@@ -1938,10 +1748,6 @@ class StreamManager:
         self.stream_errors.clear()
         self._shared_stream_registry.clear()
         
-        # Clear caches
-        if hasattr(self, '_limits_cache'):
-            self._limits_cache.clear()
-        
         # Stop shared streams
         for source in list(self.video_file_manager.shared_streams.keys()):
             self.video_file_manager.remove_shared_stream(source)
@@ -1964,55 +1770,3 @@ async def initialize_stream_manager():
         asyncio.create_task(
             stream_manager._restart_background_task_if_needed("initialization_failure")
         )
-
-
-# ==================== WebSocket Utilities ====================
-
-async def send_ping(websocket: WebSocket):
-    """Send periodic pings to keep WebSocket connection alive."""
-    try:
-        ping_interval = float(config.get("websocket_ping_interval", 30.0))
-        while websocket.client_state == WebSocketState.CONNECTED:
-            await asyncio.sleep(ping_interval)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    await websocket.send_json({
-                        "type": "ping",
-                        "timestamp": datetime.now(timezone.utc).timestamp()
-                    })
-                except RuntimeError as e:
-                    if "close message has been sent" in str(e).lower():
-                        logging.debug("Ping failed: WebSocket already closing")
-                        break
-                    else:
-                        raise
-            else:
-                break
-    except Exception as e:
-        logging.debug(f"Ping task ended: {e}")
-
-
-async def _safe_close_websocket(
-    websocket: WebSocket, 
-    username_for_log: Optional[str] = None
-):
-    """Safely close a WebSocket connection."""
-    try:
-        current_state = websocket.client_state
-        
-        if current_state == WebSocketState.CONNECTED:
-            await websocket.close()
-        elif current_state == WebSocketState.CONNECTING:
-            await asyncio.sleep(0.1)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close()
-            
-    except RuntimeError as e:
-        if any(phrase in str(e).lower() for phrase in [
-            "websocket is not connected", "already closed", "close message has been sent"
-        ]):
-            logging.debug(f"Websocket already closed for {username_for_log}")
-        else:
-            logging.warning(f"RuntimeError closing websocket: {e}")
-    except Exception as e:
-        logging.warning(f"Unexpected error closing websocket: {e}")

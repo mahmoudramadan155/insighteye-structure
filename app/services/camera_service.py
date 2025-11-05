@@ -8,7 +8,8 @@ from fastapi import HTTPException, status
 
 from app.services.database import db_manager
 from app.services.user_service import user_manager
-from app.services.qdrant_service import qdrant_service
+# from app.services.qdrant_service import qdrant_service  
+from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.workspace_service import workspace_service
 from app.utils import (
     ensure_uuid_str,
@@ -669,5 +670,120 @@ class CameraService:
                 errors.append(f"Camera {camera_id_str}: {str(e)}")
         
         return updated_cameras, failed_cameras, errors
-    
+
+    async def get_stream_by_id(self, stream_id_str: str, user_id_context_str: str) -> Dict[str, Any]:
+        """Get stream information by ID."""
+        stream_q = """
+            SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status, 
+                   u.username as owner_username, vs.workspace_id, w.name as workspace_name,
+                   vs.is_streaming, vs.user_id as owner_id, vs.created_at, vs.updated_at, vs.last_activity,
+                   vs.location, vs.area, vs.building, vs.zone, vs.floor_level, 
+                   vs.latitude, vs.longitude
+            FROM video_stream vs
+            JOIN users u ON vs.user_id = u.user_id
+            JOIN workspaces w ON vs.workspace_id = w.workspace_id
+            WHERE vs.stream_id = $1
+        """
+        stream_res = await self.db_manager.execute_query(stream_q, (UUID(stream_id_str),), fetch_one=True)
+        
+        if not stream_res:
+            raise HTTPException(status_code=404, detail="Stream not found")
+        
+        # Check workspace access
+        await check_workspace_access(
+            self.db_manager,
+            UUID(user_id_context_str),
+            stream_res["workspace_id"]
+        )
+
+        return {
+            "stream_id": str(stream_res["stream_id"]),
+            "name": stream_res["name"],
+            "path": stream_res["path"],
+            "type": stream_res["type"],
+            "status": stream_res["status"],
+            "owner_username": stream_res["owner_username"],
+            "workspace_id": str(stream_res["workspace_id"]),
+            "workspace_name": stream_res["workspace_name"],
+            "location": stream_res["location"],
+            "area": stream_res["area"],
+            "building": stream_res["building"],
+            "zone": stream_res["zone"],
+            "floor_level": stream_res["floor_level"],
+            "latitude": float(stream_res["latitude"]) if stream_res["latitude"] else None,
+            "longitude": float(stream_res["longitude"]) if stream_res["longitude"] else None,
+        }
+
+    async def get_workspace_streams(self, user_id_str: str, workspace_id_str_optional: Optional[str] = None) -> Dict[str, Any]:
+        """Get all streams for workspaces accessible to a user."""
+        user_id_obj = UUID(user_id_str)
+        target_workspace_ids_objs: List[UUID] = []
+
+        if workspace_id_str_optional:
+            try:
+                ws_id_to_check = UUID(workspace_id_str_optional)
+                await check_workspace_access(
+                    self.db_manager,
+                    user_id_obj,
+                    ws_id_to_check
+                )
+                target_workspace_ids_objs.append(ws_id_to_check)
+            except HTTPException as e:
+                return {"streams": [], "total": 0, "message": f"Access denied or workspace not found: {e.detail}"}
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid workspace ID format provided.")
+        else:
+            user_workspaces_db = await self.db_manager.execute_query(
+                "SELECT workspace_id FROM workspace_members WHERE user_id = $1",
+                (user_id_obj,), fetch_all=True
+            )
+            user_workspaces_db = user_workspaces_db or []
+            target_workspace_ids_objs = [row['workspace_id'] for row in user_workspaces_db]
+        
+        if not target_workspace_ids_objs:
+            return {"streams": [], "total": 0}
+
+        placeholders = ', '.join([f'${i+1}' for i in range(len(target_workspace_ids_objs))])
+
+        streams_q = f"""
+            SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status, vs.is_streaming,
+                   vs.user_id as owner_id, u.username as owner_username,
+                   vs.workspace_id, w.name as workspace_name,
+                   vs.created_at, vs.updated_at,
+                   vs.location, vs.area, vs.building, vs.zone, vs.floor_level, 
+                   vs.latitude, vs.longitude
+            FROM video_stream vs
+            JOIN users u ON vs.user_id = u.user_id
+            JOIN workspaces w ON vs.workspace_id = w.workspace_id
+            WHERE vs.workspace_id IN ({placeholders})
+            ORDER BY w.name, vs.name
+        """
+        streams_data_db = await self.db_manager.execute_query(streams_q, tuple(target_workspace_ids_objs), fetch_all=True)
+        streams_data_db = streams_data_db or []
+        
+        formatted_streams = [{
+            "stream_id": str(s["stream_id"]),
+            "name": s["name"],
+            "path": s["path"],
+            "type": s["type"],
+            "status": s["status"],
+            "is_streaming": s["is_streaming"],
+            "owner_id": str(s["owner_id"]),
+            "owner_username": s["owner_username"],
+            "workspace_id": str(s["workspace_id"]),
+            "workspace_name": s["workspace_name"],
+            "created_at": s["created_at"].isoformat() if s["created_at"] else None,
+            "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
+            "can_control": True,
+            "location": s["location"],
+            "area": s["area"],
+            "building": s["building"],
+            "zone": s["zone"],
+            "floor_level": s["floor_level"],
+            "latitude": float(s["latitude"]) if s["latitude"] else None,
+            "longitude": float(s["longitude"]) if s["longitude"] else None,
+        } for s in streams_data_db]
+        
+        return {"streams": formatted_streams, "total": len(formatted_streams)}
+
 camera_service = CameraService()

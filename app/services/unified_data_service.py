@@ -14,7 +14,7 @@ from app.services.qdrant_service import qdrant_service
 from app.services.elasticsearch_service import elasticsearch_service
 from app.schemas import (
     SearchQuery, TimestampRangeResponse,
-    LocationSearchQuery, DeleteDataRequest,
+    DeleteDataRequest,
     StreamUpdate
 )
 from app.config.settings import config
@@ -187,7 +187,7 @@ class UnifiedDataService:
     """
     
     def __init__(self):
-        self.backend_type = config.get("data_backend", "qdrant").lower()
+        self.backend_type = config.get("data_backend", "elasticsearch").lower()
         
         if self.backend_type == "elasticsearch":
             self.backend = ElasticsearchBackend()

@@ -1920,69 +1920,6 @@ async def initialize_stream_manager():
         logging.error(f"Failed to initialize StreamManager tasks: {e}", exc_info=True)
         asyncio.create_task(stream_manager._restart_background_task_if_needed("initialization_failure"))
 
-async def send_ping(websocket: WebSocket):
-    try:
-        ping_interval = float(config.get("websocket_ping_interval", 30.0))
-        while websocket.client_state == WebSocketState.CONNECTED:
-            await asyncio.sleep(ping_interval)
-            # Double-check state before sending ping
-            if websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    await websocket.send_json({
-                        "type": "ping", 
-                        "timestamp": datetime.now(timezone.utc).timestamp()
-                    })
-                except RuntimeError as e:
-                    if "close message has been sent" in str(e).lower():
-                        logging.debug("Ping failed: WebSocket already closing")
-                        break
-                    else:
-                        raise
-            else:
-                break 
-    except (WebSocketDisconnect, asyncio.CancelledError, ConnectionResetError, RuntimeError):
-        logging.debug("Ping task for WebSocket ended (disconnect/cancel/error).")
-    except Exception as e:
-        logging.error(f"Error in WebSocket ping task: {e}", exc_info=True)
-
-async def _safe_close_websocket(websocket: WebSocket, username_for_log: Optional[str] = None):
-    """Safely close a WebSocket connection with proper state checking."""
-    try:
-        current_state = websocket.client_state
-        
-        # Only attempt to close if the websocket is in a state that allows closing
-        if current_state == WebSocketState.CONNECTED:
-            logging.debug(f"Closing websocket for {username_for_log}, state: {current_state}")
-            await websocket.close()
-        elif current_state == WebSocketState.CONNECTING:
-            # Wait a bit for connection to establish or fail, then try to close
-            logging.debug(f"Websocket connecting for {username_for_log}, waiting before close")
-            await asyncio.sleep(0.1)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close()
-        elif current_state == WebSocketState.DISCONNECTED:
-            logging.debug(f"Websocket already disconnected for {username_for_log}")
-        elif current_state == WebSocketState.CLOSING:
-            logging.debug(f"Websocket already closing for {username_for_log}")
-        else:
-            logging.debug(f"Websocket in unexpected state {current_state} for {username_for_log}")
-            
-    except RuntimeError as e:
-        # This is expected if the websocket is already closed/disconnected
-        error_msg = str(e).lower()
-        if any(phrase in error_msg for phrase in [
-            "websocket is not connected", 
-            "already closed", 
-            "cannot call", 
-            "close message has been sent"
-        ]):
-            logging.debug(f"Websocket already closed for {username_for_log}: {e}")
-        else:
-            logging.warning(f"RuntimeError closing websocket for {username_for_log}: {e}")
-    except Exception as e:
-        logging.warning(f"Unexpected error closing websocket for {username_for_log}: {e}")
-
-
 async def process_bulk_start_request(
     websocket: WebSocket, 
     stream_ids: List[str], 

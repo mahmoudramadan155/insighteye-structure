@@ -16,7 +16,8 @@ from app.services.people_count_service import people_count_service
 from app.services.notification_service import notification_service
 from app.services.video_stream_service import video_stream_service
 from app.services.parameter_service import parameter_service
-from app.services.qdrant_service import qdrant_service
+# from app.services.qdrant_service import qdrant_service  
+from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.workspace_service import workspace_service
 from app.services.shared_stream_service import video_file_manager
 from app.services.stream_processing_service import stream_processing_service
@@ -1264,56 +1265,3 @@ async def initialize_stream_manager():
     except Exception as e:
         logging.error(f"Failed to initialize StreamManager: {e}", exc_info=True)
         asyncio.create_task(stream_manager._restart_background_task_if_needed("initialization_failure"))
-
-
-# ==================== WebSocket Utilities ====================
-
-async def send_ping(websocket: WebSocket):
-    """Send periodic pings to keep WebSocket connection alive."""
-    try:
-        ping_interval = float(config.get("websocket_ping_interval", 30.0))
-        while websocket.client_state == WebSocketState.CONNECTED:
-            await asyncio.sleep(ping_interval)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    await websocket.send_json({
-                        "type": "ping",
-                        "timestamp": datetime.now(timezone.utc).timestamp()
-                    })
-                except RuntimeError as e:
-                    if "close message has been sent" in str(e).lower():
-                        logging.debug("Ping failed: WebSocket already closing")
-                        break
-                    else:
-                        raise
-            else:
-                break
-    except Exception as e:
-        logging.debug(f"Ping task ended: {e}")
-
-
-async def _safe_close_websocket(
-    websocket: WebSocket, 
-    username_for_log: Optional[str] = None
-):
-    """Safely close a WebSocket connection."""
-    try:
-        current_state = websocket.client_state
-        
-        if current_state == WebSocketState.CONNECTED:
-            await websocket.close()
-        elif current_state == WebSocketState.CONNECTING:
-            await asyncio.sleep(0.1)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close()
-            
-    except RuntimeError as e:
-        if any(phrase in str(e).lower() for phrase in [
-            "websocket is not connected", "already closed", "close message has been sent"
-        ]):
-            logging.debug(f"Websocket already closed for {username_for_log}")
-        else:
-            logging.warning(f"RuntimeError closing websocket: {e}")
-    except Exception as e:
-        logging.warning(f"Unexpected error closing websocket: {e}")
-    

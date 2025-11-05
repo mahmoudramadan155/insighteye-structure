@@ -15,7 +15,8 @@ from app.services.people_count_service import people_count_service
 from app.services.notification_service import notification_service
 from app.services.video_stream_service import video_stream_service
 from app.services.parameter_service import parameter_service
-from app.services.qdrant_service import qdrant_service
+# from app.services.qdrant_service import qdrant_service
+from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.shared_stream_service import video_file_manager
 from app.services.stream_processing_service import stream_processing_service
 from app.config.settings import config
@@ -229,11 +230,17 @@ class StreamManager:
                 logging.info(f"Stream {stream_id_str} already active or being started.")
                 return
             
+            # Initialize with 'starting' status
             self.active_streams[stream_id_str] = {
                 'status': 'starting',
                 'task': None,
                 'start_time': datetime.now(timezone.utc),
-                'location_info': location_info or {}
+                'location_info': location_info or {},
+                'source': source,
+                'camera_name': camera_name,
+                'username': owner_username,
+                'user_id': owner_id,
+                'workspace_id': workspace_id,
             }
 
         try:
@@ -264,22 +271,32 @@ class StreamManager:
             )
             task.set_name(f"process_stream_{stream_id_str}")
 
+            # Add done callback to detect task failures
+            def task_done_callback(t):
+                try:
+                    if t.exception():
+                        logging.error(f"Stream processing task for {stream_id_str} failed: {t.exception()}", exc_info=t.exception())
+                        # Mark stream as error in database
+                        asyncio.create_task(self._handle_stream_task_failure(stream_id_str, stream_id, workspace_id, owner_id, camera_name))
+                    elif t.cancelled():
+                        logging.info(f"Stream processing task for {stream_id_str} was cancelled")
+                    else:
+                        logging.info(f"Stream processing task for {stream_id_str} completed normally")
+                except Exception as e:
+                    logging.error(f"Error in task_done_callback for {stream_id_str}: {e}", exc_info=True)
+            
+            task.add_done_callback(task_done_callback)
+
             async with self._lock:
-                self.active_streams[stream_id_str] = {
-                    'source': source,
-                    'stop_event': stop_event,
-                    'camera_name': camera_name,
-                    'username': owner_username,
-                    'user_id': owner_id,
-                    'workspace_id': workspace_id,
-                    'clients': set(),
-                    'latest_frame': None,
-                    'last_frame_time': datetime.now(timezone.utc),
-                    'task': task,
-                    'start_time': self.active_streams[stream_id_str]['start_time'],
-                    'status': 'active_pending',
-                    'location_info': location_info or {}
-                }
+                if stream_id_str in self.active_streams: 
+                    self.active_streams[stream_id_str].update({
+                        'stop_event': stop_event,
+                        'clients': set(),
+                        'latest_frame': None,
+                        'last_frame_time': datetime.now(timezone.utc),
+                        'task': task,
+                        'status': 'active_pending',  
+                    })
             
             asyncio.create_task(self._ensure_collection_for_stream_workspace(workspace_id))
             logging.info(f"Background processing task created for stream {stream_id_str} ({camera_name})")
@@ -674,49 +691,6 @@ class StreamManager:
 
     # ==================== API Methods ====================
 
-    async def get_stream_by_id(self, stream_id_str: str, user_id_context_str: str) -> Dict[str, Any]:
-        """Get stream information by ID."""
-        stream_q = """
-            SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status, 
-                   u.username as owner_username, vs.workspace_id, w.name as workspace_name,
-                   vs.is_streaming, vs.user_id as owner_id, vs.created_at, vs.updated_at, vs.last_activity,
-                   vs.location, vs.area, vs.building, vs.zone, vs.floor_level, 
-                   vs.latitude, vs.longitude
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            WHERE vs.stream_id = $1
-        """
-        stream_res = await self.db_manager.execute_query(stream_q, (UUID(stream_id_str),), fetch_one=True)
-        
-        if not stream_res:
-            raise HTTPException(status_code=404, detail="Stream not found")
-        
-        # Check workspace access
-        await check_workspace_access(
-            self.db_manager,
-            UUID(user_id_context_str),
-            stream_res["workspace_id"]
-        )
-
-        return {
-            "stream_id": str(stream_res["stream_id"]),
-            "name": stream_res["name"],
-            "path": stream_res["path"],
-            "type": stream_res["type"],
-            "status": stream_res["status"],
-            "owner_username": stream_res["owner_username"],
-            "workspace_id": str(stream_res["workspace_id"]),
-            "workspace_name": stream_res["workspace_name"],
-            "location": stream_res["location"],
-            "area": stream_res["area"],
-            "building": stream_res["building"],
-            "zone": stream_res["zone"],
-            "floor_level": stream_res["floor_level"],
-            "latitude": float(stream_res["latitude"]) if stream_res["latitude"] else None,
-            "longitude": float(stream_res["longitude"]) if stream_res["longitude"] else None,
-        }
-
     async def start_stream_in_workspace(self, stream_id_to_start_str: str, requester_user_id_str: str) -> Dict[str, Any]:
         """Start a stream in a workspace."""
         stream_id_obj = UUID(stream_id_to_start_str)
@@ -778,78 +752,6 @@ class StreamManager:
             "message": "Stream start initiated. Will be processed by the stream manager."
         }
 
-    async def get_workspace_streams(self, user_id_str: str, workspace_id_str_optional: Optional[str] = None) -> Dict[str, Any]:
-        """Get all streams for workspaces accessible to a user."""
-        user_id_obj = UUID(user_id_str)
-        target_workspace_ids_objs: List[UUID] = []
-
-        if workspace_id_str_optional:
-            try:
-                ws_id_to_check = UUID(workspace_id_str_optional)
-                await check_workspace_access(
-                    self.db_manager,
-                    user_id_obj,
-                    ws_id_to_check
-                )
-                target_workspace_ids_objs.append(ws_id_to_check)
-            except HTTPException as e:
-                return {"streams": [], "total": 0, "message": f"Access denied or workspace not found: {e.detail}"}
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid workspace ID format provided.")
-        else:
-            user_workspaces_db = await self.db_manager.execute_query(
-                "SELECT workspace_id FROM workspace_members WHERE user_id = $1",
-                (user_id_obj,), fetch_all=True
-            )
-            user_workspaces_db = user_workspaces_db or []
-            target_workspace_ids_objs = [row['workspace_id'] for row in user_workspaces_db]
-        
-        if not target_workspace_ids_objs:
-            return {"streams": [], "total": 0}
-
-        placeholders = ', '.join([f'${i+1}' for i in range(len(target_workspace_ids_objs))])
-
-        streams_q = f"""
-            SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status, vs.is_streaming,
-                   vs.user_id as owner_id, u.username as owner_username,
-                   vs.workspace_id, w.name as workspace_name,
-                   vs.created_at, vs.updated_at,
-                   vs.location, vs.area, vs.building, vs.zone, vs.floor_level, 
-                   vs.latitude, vs.longitude
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            WHERE vs.workspace_id IN ({placeholders})
-            ORDER BY w.name, vs.name
-        """
-        streams_data_db = await self.db_manager.execute_query(streams_q, tuple(target_workspace_ids_objs), fetch_all=True)
-        streams_data_db = streams_data_db or []
-        
-        formatted_streams = [{
-            "stream_id": str(s["stream_id"]),
-            "name": s["name"],
-            "path": s["path"],
-            "type": s["type"],
-            "status": s["status"],
-            "is_streaming": s["is_streaming"],
-            "owner_id": str(s["owner_id"]),
-            "owner_username": s["owner_username"],
-            "workspace_id": str(s["workspace_id"]),
-            "workspace_name": s["workspace_name"],
-            "created_at": s["created_at"].isoformat() if s["created_at"] else None,
-            "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
-            "can_control": True,
-            "location": s["location"],
-            "area": s["area"],
-            "building": s["building"],
-            "zone": s["zone"],
-            "floor_level": s["floor_level"],
-            "latitude": float(s["latitude"]) if s["latitude"] else None,
-            "longitude": float(s["longitude"]) if s["longitude"] else None,
-        } for s in streams_data_db]
-        
-        return {"streams": formatted_streams, "total": len(formatted_streams)}
-
     # ==================== Diagnostics ====================
 
     async def get_video_sharing_stats(self) -> Dict[str, Any]:
@@ -910,20 +812,31 @@ class StreamManager:
         except Exception as e:
             return {'error': str(e)}
 
-    async def force_restart_shared_stream(self, source_path: str) -> bool:
-        """Force restart a shared stream."""
+
+    async def _handle_stream_task_failure(self, stream_id_str: str, stream_id: UUID, 
+                                        workspace_id: UUID, owner_id: UUID, camera_name: str):
+        """Handle stream processing task failure."""
         try:
-            if source_path in self.video_file_manager.shared_streams:
-                shared_stream = self.video_file_manager.shared_streams[source_path]
-                affected_stream_ids = list(shared_stream.subscribers.keys())
-                shared_stream._stop_capture()
-                await asyncio.sleep(2.0)
-                logging.info(f"Force restarted shared stream for {source_path}. Affected streams: {affected_stream_ids}")
-                return True
-            return False
+            # Remove from active streams
+            async with self._lock:
+                self.active_streams.pop(stream_id_str, None)
+            
+            # Update database status
+            await self.video_stream_service.update_stream_status(
+                stream_id, 'error', is_streaming=False
+            )
+            
+            # Create notification
+            await self.notification_service.create_notification(
+                workspace_id=workspace_id,
+                user_id=owner_id,
+                status="error",
+                message=f"Stream processing failed for camera '{camera_name}'",
+                stream_id=stream_id,
+                camera_name=camera_name
+            )
         except Exception as e:
-            logging.error(f"Error force restarting shared stream {source_path}: {e}", exc_info=True)
-            return False
+            logging.error(f"Error handling stream task failure for {stream_id_str}: {e}", exc_info=True)
 
 
 # ==================== Global Instance ====================
@@ -940,101 +853,3 @@ async def initialize_stream_manager():
         logging.error(f"Failed to initialize StreamManager tasks: {e}", exc_info=True)
         asyncio.create_task(stream_manager._restart_background_task_if_needed("initialization_failure"))
 
-
-# ==================== WebSocket Utilities ====================
-
-async def send_ping(websocket: WebSocket):
-    """Send periodic pings to keep WebSocket connection alive."""
-    try:
-        ping_interval = float(config.get("websocket_ping_interval", 30.0))
-        while websocket.client_state == WebSocketState.CONNECTED:
-            await asyncio.sleep(ping_interval)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    await websocket.send_json({
-                        "type": "ping",
-                        "timestamp": datetime.now(timezone.utc).timestamp()
-                    })
-                except RuntimeError as e:
-                    if "close message has been sent" in str(e).lower():
-                        logging.debug("Ping failed: WebSocket already closing")
-                        break
-                    else:
-                        raise
-            else:
-                break
-    except (WebSocketDisconnect, asyncio.CancelledError, ConnectionResetError, RuntimeError):
-        logging.debug("Ping task for WebSocket ended")
-    except Exception as e:
-        logging.error(f"Error in WebSocket ping task: {e}", exc_info=True)
-
-
-async def _safe_close_websocket(websocket: WebSocket, username_for_log: Optional[str] = None):
-    """Safely close a WebSocket connection with proper state checking."""
-    try:
-        current_state = websocket.client_state
-        
-        if current_state == WebSocketState.CONNECTED:
-            logging.debug(f"Closing websocket for {username_for_log}, state: {current_state}")
-            await websocket.close()
-        elif current_state == WebSocketState.CONNECTING:
-            logging.debug(f"Websocket connecting for {username_for_log}, waiting before close")
-            await asyncio.sleep(0.1)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close()
-        elif current_state == WebSocketState.DISCONNECTED:
-            logging.debug(f"Websocket already disconnected for {username_for_log}")
-        elif current_state == WebSocketState.CLOSING:
-            logging.debug(f"Websocket already closing for {username_for_log}")
-            
-    except RuntimeError as e:
-        error_msg = str(e).lower()
-        if any(phrase in error_msg for phrase in [
-            "websocket is not connected",
-            "already closed",
-            "cannot call",
-            "close message has been sent"
-        ]):
-            logging.debug(f"Websocket already closed for {username_for_log}: {e}")
-        else:
-            logging.warning(f"RuntimeError closing websocket for {username_for_log}: {e}")
-    except Exception as e:
-        logging.warning(f"Unexpected error closing websocket for {username_for_log}: {e}")
-
-
-async def handle_mark_read_message(message: dict, user_id_str: str, username_for_log: str, websocket: WebSocket):
-    """Handle mark_read messages from WebSocket."""
-    try:
-        notif_ids_raw = message.get("notification_ids", [])
-        if isinstance(notif_ids_raw, list) and user_id_str:
-            updated_count = 0
-            valid_notif_ids_to_mark: List[UUID] = []
-            
-            for nid_str_raw in notif_ids_raw:
-                try:
-                    valid_notif_ids_to_mark.append(UUID(str(nid_str_raw)))
-                except ValueError:
-                    logging.warning(f"Invalid notification ID format for mark_read from {username_for_log}: {nid_str_raw}")
-            
-            if valid_notif_ids_to_mark:
-                for nid_uuid in valid_notif_ids_to_mark:
-                    try:
-                        res = await db_manager.execute_query(
-                            "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
-                            (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)),
-                            return_rowcount=True
-                        )
-                        if res and res > 0:
-                            updated_count += 1
-                    except Exception as e_mark:
-                        logging.error(f"Error marking notification {nid_uuid} as read for {user_id_str}: {e_mark}")
-            
-            # Send acknowledgment
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_json({
-                    "type": "ack_mark_read",
-                    "ids": notif_ids_raw,
-                    "updated_count": updated_count
-                })
-    except Exception as e:
-        logging.error(f"Error handling mark_read for {username_for_log}: {e}")

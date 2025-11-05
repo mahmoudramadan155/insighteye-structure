@@ -12,7 +12,8 @@ from app.config.settings import config
 from app.services.database import db_manager
 from app.services.user_service import user_manager
 from app.services.session_service import session_manager
-from app.services.stream_service2 import stream_manager, send_ping, _safe_close_websocket, process_bulk_start_request
+from app.services.stream_service2 import stream_manager, process_bulk_start_request
+from app.utils import safe_close_websocket, send_ping
 import concurrent.futures
 import os
 from starlette.websockets import WebSocketState
@@ -633,7 +634,7 @@ async def websocket_notify(websocket: WebSocket):
         # except Exception as e_close:
         #     logging.debug(f"Error closing websocket for {username_for_log}: {e_close}")
         
-        await _safe_close_websocket(websocket, username_for_log)
+        await safe_close_websocket(websocket, username_for_log)
 
         logging.debug(f"Notify WS: Connection cleanup for {username_for_log or 'unknown'}.")
 

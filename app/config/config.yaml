@@ -81,13 +81,19 @@ otp_sender_email: "mimo16603@gmail.com"
 insert_batch_size: 5
 insert_interval: 60 #seconds
 
+DATA_BACKEND: elasticsearch
+
 qdrant_url: "qdrant"
 qdrant_port: 6333
 qdrant_collection_name: "person_counts"
 query_timeout: 50
 qdrant_fetch_limit: 50
+qdrant_vector_size: 1
 
 elasticsearch_hosts: "http://elasticsearch:9200"
+elasticsearch_index_name: person_counts
+elasticsearch_timeout: 60.0
+elasticsearch_version: 8
 
 session_id: "2gXz1vQjW7-M6XsHwZp9D1BEXyL3oAqVfJbYK9t5U2c"
 

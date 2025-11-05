@@ -12,13 +12,12 @@ import os
 from fastapi.encoders import jsonable_encoder
 from starlette.websockets import WebSocketState
 
-from app.utils import frame_to_base64, check_workspace_access
+from app.utils import frame_to_base64, check_workspace_access, safe_close_websocket, send_ping, handle_mark_read_message
 from app.config.settings import config
 from app.services.database import db_manager
 from app.services.user_service import user_manager
 from app.services.session_service import session_manager
 from app.services.stream_service_2 import stream_manager
-from app.schemas import ThresholdSettings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/streams2", tags=["streams2"]) 
@@ -27,106 +26,6 @@ router = APIRouter(prefix="/streams2", tags=["streams2"])
 thread_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=min(32, (os.cpu_count() or 1) * 2 + 4)
 )
-
-
-# ==================== Helper Functions ====================
-
-async def _safe_close_websocket(websocket: WebSocket, username_for_log: Optional[str] = None):
-    """Safely close a WebSocket connection with proper state checking."""
-    try:
-        current_state = websocket.client_state
-        
-        if current_state == WebSocketState.CONNECTED:
-            logger.debug(f"Closing websocket for {username_for_log}, state: {current_state}")
-            await websocket.close()
-        elif current_state == WebSocketState.CONNECTING:
-            logger.debug(f"Websocket connecting for {username_for_log}, waiting before close")
-            await asyncio.sleep(0.1)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.close()
-        elif current_state == WebSocketState.DISCONNECTED:
-            logger.debug(f"Websocket already disconnected for {username_for_log}")
-        elif current_state == WebSocketState.CLOSING:
-            logger.debug(f"Websocket already closing for {username_for_log}")
-            
-    except RuntimeError as e:
-        error_msg = str(e).lower()
-        if any(phrase in error_msg for phrase in [
-            "websocket is not connected",
-            "already closed",
-            "cannot call",
-            "close message has been sent"
-        ]):
-            logger.debug(f"Websocket already closed for {username_for_log}: {e}")
-        else:
-            logger.warning(f"RuntimeError closing websocket for {username_for_log}: {e}")
-    except Exception as e:
-        logger.warning(f"Unexpected error closing websocket for {username_for_log}: {e}")
-
-
-async def send_ping(websocket: WebSocket):
-    """Send periodic pings to keep WebSocket connection alive."""
-    try:
-        ping_interval = float(config.get("websocket_ping_interval", 30.0))
-        while websocket.client_state == WebSocketState.CONNECTED:
-            await asyncio.sleep(ping_interval)
-            if websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    await websocket.send_json({
-                        "type": "ping",
-                        "timestamp": datetime.now(timezone.utc).timestamp()
-                    })
-                except RuntimeError as e:
-                    if "close message has been sent" in str(e).lower():
-                        logger.debug("Ping failed: WebSocket already closing")
-                        break
-                    else:
-                        raise
-            else:
-                break
-    except (WebSocketDisconnect, asyncio.CancelledError, ConnectionResetError, RuntimeError):
-        logger.debug("Ping task for WebSocket ended")
-    except Exception as e:
-        logger.error(f"Error in WebSocket ping task: {e}", exc_info=True)
-
-
-async def handle_mark_read_message(message: dict, user_id_str: str, username_for_log: str, websocket: WebSocket):
-    """Handle mark_read messages from WebSocket."""
-    try:
-        notif_ids_raw = message.get("notification_ids", [])
-        if isinstance(notif_ids_raw, list) and user_id_str:
-            updated_count = 0
-            valid_notif_ids_to_mark: List[UUID] = []
-            
-            for nid_str_raw in notif_ids_raw:
-                try:
-                    valid_notif_ids_to_mark.append(UUID(str(nid_str_raw)))
-                except ValueError:
-                    logger.warning(f"Invalid notification ID format for mark_read from {username_for_log}: {nid_str_raw}")
-            
-            if valid_notif_ids_to_mark:
-                for nid_uuid in valid_notif_ids_to_mark:
-                    try:
-                        res = await db_manager.execute_query(
-                            "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
-                            (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)),
-                            return_rowcount=True
-                        )
-                        if res and res > 0:
-                            updated_count += 1
-                    except Exception as e_mark:
-                        logger.error(f"Error marking notification {nid_uuid} as read for {user_id_str}: {e_mark}")
-            
-            # Send acknowledgment
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_json({
-                    "type": "ack_mark_read",
-                    "ids": notif_ids_raw,
-                    "updated_count": updated_count
-                })
-    except Exception as e:
-        logger.error(f"Error handling mark_read for {username_for_log}: {e}")
-
 
 # ==================== Stream Control Endpoints ====================
 
@@ -210,151 +109,6 @@ async def stop_workspace_stream_endpoint(
         logger.error(f"Error stopping stream {stream_id_str}: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
 
-
-@router.get("/streams")
-async def get_all_workspace_streams_endpoint(
-    workspace_id: Optional[str] = Query(None, description="Specific workspace ID (optional)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get all streams accessible to the user."""
-    try:
-        user_id_str = str(current_user_data["user_id"])
-        result = await stream_manager.get_workspace_streams(user_id_str, workspace_id)
-        return JSONResponse(content={"status": "success", "data": result})
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
-    except Exception as e:
-        logger.error(f"Error getting workspace streams: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
-
-
-@router.get("/streams/{stream_id}")
-async def get_stream_by_id(
-    stream_id: str,
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get details for a specific stream."""
-    try:
-        user_id_str = str(current_user_data["user_id"])
-        result = await stream_manager.get_stream_by_id(stream_id, user_id_str)
-        return JSONResponse(content={"status": "success", "data": result})
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
-    except Exception as e:
-        logger.error(f"Error getting stream {stream_id}: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
-
-
-# ==================== Threshold Management ====================
-
-@router.post("/streams/{stream_id}/thresholds")
-async def update_stream_thresholds(
-    stream_id: str,
-    settings: ThresholdSettings,
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Update count thresholds for a specific stream."""
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        stream_id_uuid = UUID(stream_id)
-        
-        # Verify stream exists and user has access
-        stream_info = await db_manager.execute_query(
-            "SELECT workspace_id, name FROM video_stream WHERE stream_id = $1",
-            (stream_id_uuid,), fetch_one=True
-        )
-        
-        if not stream_info:
-            raise HTTPException(status_code=404, detail="Stream not found")
-        
-        # Check workspace membership
-        await check_workspace_access(
-            db_manager,
-            UUID(requester_user_id_str),
-            stream_info['workspace_id'],
-        )
-        
-        # Validate thresholds
-        if (settings.count_threshold_greater is not None and 
-            settings.count_threshold_less is not None and 
-            settings.count_threshold_greater <= settings.count_threshold_less):
-            raise HTTPException(status_code=400, detail="Greater threshold must be higher than less threshold")
-        
-        # Update thresholds
-        await db_manager.execute_query(
-            """UPDATE video_stream 
-               SET count_threshold_greater = $1, count_threshold_less = $2, 
-                   alert_enabled = $3, updated_at = NOW() 
-               WHERE stream_id = $4""",
-            (settings.count_threshold_greater, settings.count_threshold_less,
-             settings.alert_enabled, stream_id_uuid)
-        )
-        
-        return JSONResponse(content={
-            "status": "success",
-            "message": f"Thresholds updated for stream '{stream_info['name']}'",
-            "settings": {
-                "count_threshold_greater": settings.count_threshold_greater,
-                "count_threshold_less": settings.count_threshold_less,
-                "alert_enabled": settings.alert_enabled
-            }
-        })
-        
-    except HTTPException:
-        raise
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid stream ID format")
-    except Exception as e:
-        logger.error(f"Error updating stream thresholds: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@router.get("/streams/{stream_id}/thresholds")
-async def get_stream_thresholds(
-    stream_id: str,
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get count thresholds for a specific stream."""
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        stream_id_uuid = UUID(stream_id)
-        
-        # Get stream info with thresholds
-        stream_info = await db_manager.execute_query(
-            """SELECT vs.workspace_id, vs.name, vs.count_threshold_greater, 
-                      vs.count_threshold_less, vs.alert_enabled
-               FROM video_stream vs WHERE vs.stream_id = $1""",
-            (stream_id_uuid,), fetch_one=True
-        )
-        
-        if not stream_info:
-            raise HTTPException(status_code=404, detail="Stream not found")
-        
-        # Check workspace membership
-        await check_workspace_access(
-            db_manager,
-            UUID(requester_user_id_str),
-            stream_info['workspace_id'],
-        )
-        
-        return JSONResponse(content={
-            "status": "success",
-            "stream_id": stream_id,
-            "name": stream_info['name'],
-            "thresholds": {
-                "count_threshold_greater": stream_info.get('count_threshold_greater'),
-                "count_threshold_less": stream_info.get('count_threshold_less'),
-                "alert_enabled": stream_info.get('alert_enabled', False)
-            }
-        })
-        
-    except HTTPException:
-        raise
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid stream ID format")
-    except Exception as e:
-        logger.error(f"Error getting stream thresholds: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ==================== WebSocket Endpoints ====================
@@ -573,7 +327,7 @@ async def websocket_workspace_stream(websocket: WebSocket):
             await stream_manager.disconnect_client(stream_id_str, websocket)
         
         if not websocket_closed:
-            await _safe_close_websocket(websocket, user_id_for_log)
+            await safe_close_websocket(websocket, user_id_for_log)
 
 
 @router.websocket("/notify")
@@ -753,7 +507,7 @@ async def websocket_notify(websocket: WebSocket):
                 logger.error(f"Error unsubscribing {username_for_log}: {e_unsub}")
 
         if not websocket_closed:
-            await _safe_close_websocket(websocket, username_for_log)
+            await safe_close_websocket(websocket, username_for_log)
 
 
 # ==================== HTTP Notification Endpoints ====================
@@ -897,28 +651,6 @@ async def debug_stream_status(
     except Exception as e:
         logger.error(f"Error in debug_stream_status for stream {stream_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get stream status: {str(e)}")
-
-
-@router.post("/debug/force_restart_shared/{source_path}")
-async def debug_force_restart_shared_stream(
-    source_path: str,
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Force restart a shared stream for debugging."""
-    # Check if user is admin
-    if current_user_data.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    try:
-        import urllib.parse
-        decoded_source = urllib.parse.unquote(source_path)
-        from app.services.shared_stream_service import video_file_manager
-        
-        result = await video_file_manager.force_restart_shared_stream(decoded_source)
-        return {"status": "success" if result else "failed", "source": decoded_source}
-    except Exception as e:
-        logger.error(f"Error restarting shared stream: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
 
 
 # ==================== Statistics Endpoints ====================

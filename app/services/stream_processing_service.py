@@ -73,7 +73,7 @@ class StreamProcessingService:
     def detect_objects_with_threshold(
         self,
         frame: np.ndarray,
-        conf_threshold: float = 0.4,
+        conf_threshold: float = 0.5,
         threshold_settings: Dict[str, Any] = None,
         stream_id_str: str = None
     ) -> Tuple[np.ndarray, int, bool, int, int, str]:
@@ -85,7 +85,7 @@ class StreamProcessingService:
             return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
 
         # Stream-specific frame counting
-        if stream_id_str:
+        if stream_id_str and self.stream_manager:
             frame_count = self.stream_manager.fire_detection_frame_counts.get(stream_id_str, 0) + 1
             self.stream_manager.fire_detection_frame_counts[stream_id_str] = frame_count
         else:
@@ -125,14 +125,14 @@ class StreamProcessingService:
             )
 
             person_count = 0
-            if people_results and people_results[0].boxes is not None:
+            if people_results and len(people_results) > 0 and people_results[0].boxes is not None:
                 person_count = len(people_results[0].boxes)
 
             # Gender detection (every 3rd frame when people detected)
             if person_count > 0 and frame_count % 3 == 0 and self.gender_model:
                 try:
-                    gender_results = self.gender_model(source=input_frame, conf=0.3, verbose=False)
-                    if gender_results and gender_results[0].boxes is not None:
+                    gender_results = self.gender_model(source=input_frame, conf=0.5, verbose=False)
+                    if gender_results and len(gender_results) > 0 and gender_results[0].boxes is not None:
                         male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
                         female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
                         cache['male_count'] = male_count
@@ -144,10 +144,10 @@ class StreamProcessingService:
             # Fire detection (every 10th frame)
             if frame_count % 10 == 0 and self.fire_model:
                 try:
-                    fire_results = self.fire_model(source=input_frame, conf=0.3, verbose=False)
+                    fire_results = self.fire_model(source=input_frame, conf=0.8, verbose=False)
                     
                     current_fire_status = "no detection"
-                    if fire_results and fire_results[0].boxes is not None:
+                    if fire_results and len(fire_results) > 0 and fire_results[0].boxes is not None:
                         classes = [int(box.cls) for box in fire_results[0].boxes]
                         if 0 in classes:
                             current_fire_status = "fire"
@@ -163,7 +163,7 @@ class StreamProcessingService:
                         if current_fire_status in ["fire", "smoke"]:
                             logger.warning(f"🔥 Fire detection change: {stream_id_str} changed to '{current_fire_status}'")
                         else:
-                            logger.warning(f"🌊 Fire cleared: {stream_id_str} changed to 'no detection'")
+                            logger.info(f"🌊 Fire cleared: {stream_id_str} changed to 'no detection'")
                     
                 except Exception as e:
                     logger.error(f"Fire detection error for stream {stream_id_str}: {e}")
@@ -185,11 +185,9 @@ class StreamProcessingService:
                     alert_triggered = True
 
             # Annotate frame
-            annotated_frame = (
-                people_results[0].plot(img=input_frame.copy())
-                if people_results and people_results[0].boxes is not None
-                else input_frame.copy()
-            )
+            annotated_frame = input_frame.copy()
+            if people_results and len(people_results) > 0 and people_results[0].boxes is not None:
+                annotated_frame = people_results[0].plot(img=annotated_frame)
             
             # Add text overlays
             count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
@@ -257,10 +255,13 @@ class StreamProcessingService:
         loop = asyncio.get_event_loop()
         
         def check_source():
-            cap = cv2.VideoCapture(source)
-            is_valid = cap.isOpened()
-            cap.release()
-            return is_valid
+            try:
+                cap = cv2.VideoCapture(source)
+                is_valid = cap.isOpened()
+                cap.release()
+                return is_valid
+            except Exception:
+                return False
         
         try:
             return await loop.run_in_executor(thread_pool, check_source)
@@ -438,10 +439,14 @@ class StreamProcessingService:
         stream_id_str = str(stream_id)
         loop = asyncio.get_event_loop()
         shared_stream = None
+        first_frame_received = False
+        consecutive_failures = 0
+        max_consecutive_failures = 30
         
         # Initialize fire detection state
-        self.stream_manager.fire_detection_states[stream_id_str] = "no detection"
-        self.stream_manager.fire_detection_frame_counts[stream_id_str] = 0
+        if self.stream_manager:
+            self.stream_manager.fire_detection_states[stream_id_str] = "no detection"
+            self.stream_manager.fire_detection_frame_counts[stream_id_str] = 0
         
         logger.info(f"Starting stream processing for {stream_id_str} ({camera_name})")
         
@@ -451,43 +456,57 @@ class StreamProcessingService:
             
             # Validate source
             if not await self._validate_stream_source(source):
+                logger.error(f"Invalid or inaccessible video source: {source}")
                 raise RuntimeError(f"Invalid or inaccessible video source: {source}")
             
             # Get stream parameters
             from app.services.parameter_service import parameter_service
             params = await parameter_service.get_workspace_params(workspace_id)
             frame_skip = params.get("frame_skip", 300)
-            frame_delay_target = params.get("frame_delay", 0.0)
-            conf_threshold = params.get("conf", 0.4)
+            frame_delay_target = params.get("frame_delay", 0.033)  # ~30 FPS default
+            conf_threshold = params.get("conf", 0.5)
             
-            # Check for shared stream
-            shared_stream = self.stream_manager.get_shared_stream(source)
-            if not shared_stream:
-                shared_stream = self.stream_manager.create_shared_stream(
-                    source, owner_username, stream_id
-                )
-                logger.info(f"Created new shared stream for source: {source}")
-            else:
-                logger.info(f"Using existing shared stream for source: {source}")
+            # Get or create shared stream
+            shared_stream = self.video_file_manager.get_shared_stream(source)
             
-            # Register consumer
-            shared_stream.register_consumer(stream_id_str)
+            # Add this stream as a subscriber
+            if not shared_stream.add_subscriber(stream_id_str):
+                logger.error(f"Failed to add subscriber {stream_id_str} to shared stream")
+                raise RuntimeError(f"Failed to subscribe to shared stream for {source}")
+            
+            logger.info(f"Stream {stream_id_str} subscribed to shared stream for {source}")
             
             # Main processing loop
             while not stop_event.is_set():
                 try:
+                    # Wait for frame to be available
+                    if not shared_stream.wait_for_frame(timeout=5.0):
+                        consecutive_failures += 1
+                        if consecutive_failures > max_consecutive_failures:
+                            logger.error(f"Too many consecutive frame failures for {stream_id_str}")
+                            break
+                        await asyncio.sleep(0.1)
+                        continue
+                    
                     # Get frame from shared stream
-                    frame_data = await shared_stream.get_frame(timeout=5.0)
+                    frame = shared_stream.get_latest_frame(stream_id_str)
                     
-                    if frame_data is None:
-                        logger.warning(f"No frame data for stream {stream_id_str}")
-                        await asyncio.sleep(0.1)
-                        continue
-                    
-                    frame = frame_data.get("frame")
                     if frame is None or frame.size == 0:
+                        consecutive_failures += 1
+                        if consecutive_failures > max_consecutive_failures:
+                            logger.error(f"Too many consecutive empty frames for {stream_id_str}")
+                            break
                         await asyncio.sleep(0.1)
                         continue
+                    
+                    # Reset failure counter on successful frame
+                    consecutive_failures = 0
+                    
+                    # Mark as active after first successful frame
+                    if not first_frame_received:
+                        first_frame_received = True
+                        await self.update_stream_to_active(stream_id_str)
+                        logger.info(f"First frame received for stream {stream_id_str}")
                     
                     frame_count += 1
                     
@@ -503,14 +522,20 @@ class StreamProcessingService:
                         )
                     
                     # Update stream manager with processed frame
-                    self.stream_manager.update_stream_frame(
-                        stream_id_str,
-                        annotated_frame,
-                        person_count,
-                        male_count,
-                        female_count,
-                        fire_status
-                    )
+                    if self.stream_manager:
+                        async with self.stream_manager._lock:
+                            if stream_id_str in self.stream_manager.active_streams:
+                                self.stream_manager.active_streams[stream_id_str]['latest_frame'] = annotated_frame
+                                self.stream_manager.active_streams[stream_id_str]['last_frame_time'] = datetime.now(timezone.utc)
+                                self.stream_manager.active_streams[stream_id_str]['person_count'] = person_count
+                                self.stream_manager.active_streams[stream_id_str]['male_count'] = male_count
+                                self.stream_manager.active_streams[stream_id_str]['female_count'] = female_count
+                                self.stream_manager.active_streams[stream_id_str]['fire_status'] = fire_status
+                    
+                    # Update processing stats
+                    if stream_id_str in self.stream_manager.stream_processing_stats:
+                        self.stream_manager.stream_processing_stats[stream_id_str]['frames_processed'] += 1
+                        self.stream_manager.stream_processing_stats[stream_id_str]['last_updated'] = datetime.now(timezone.utc)
                     
                     # Handle alerts
                     if alert_triggered and threshold_settings.get("alert_enabled"):
@@ -545,6 +570,10 @@ class StreamProcessingService:
                     break
                 except Exception as e:
                     logger.error(f"Error in processing loop for {stream_id_str}: {e}", exc_info=True)
+                    consecutive_failures += 1
+                    if consecutive_failures > max_consecutive_failures:
+                        logger.error(f"Too many consecutive errors for {stream_id_str}")
+                        break
                     await asyncio.sleep(1)
             
         except Exception as e:
@@ -556,15 +585,18 @@ class StreamProcessingService:
             logger.info(f"Cleaning up stream {stream_id_str}")
             
             if shared_stream:
-                shared_stream.unregister_consumer(stream_id_str)
-                if not shared_stream.has_consumers():
-                    self.stream_manager.remove_shared_stream(source)
-                    logger.info(f"Removed shared stream for source: {source}")
+                shared_stream.remove_subscriber(stream_id_str)
+                logger.info(f"Removed subscriber {stream_id_str} from shared stream")
             
             # Clear cache
             cache_key = f"cache_{stream_id_str}"
             if cache_key in self._cached_results:
                 del self._cached_results[cache_key]
+            
+            # Clear fire detection state
+            if self.stream_manager:
+                self.stream_manager.fire_detection_states.pop(stream_id_str, None)
+                self.stream_manager.fire_detection_frame_counts.pop(stream_id_str, None)
             
             # Update database
             try:
@@ -580,7 +612,7 @@ class StreamProcessingService:
     async def process_single_frame(
         self,
         frame: np.ndarray,
-        conf_threshold: float = 0.4
+        conf_threshold: float = 0.5
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Process a single frame and return annotated frame with detection data."""
         loop = asyncio.get_event_loop()
@@ -604,6 +636,28 @@ class StreamProcessingService:
         
         return annotated_frame, detection_data
 
+    async def update_stream_to_active(self, stream_id_str: str):
+        """Update stream status to 'active' when processing successfully starts."""
+        if not self.stream_manager:
+            return
+            
+        async with self.stream_manager._lock:
+            if stream_id_str in self.stream_manager.active_streams:
+                current_status = self.stream_manager.active_streams[stream_id_str].get('status')
+                if current_status == 'active_pending':
+                    self.stream_manager.active_streams[stream_id_str]['status'] = 'active'
+                    self.stream_manager.active_streams[stream_id_str]['last_frame_time'] = datetime.now(timezone.utc)
+                    logger.info(f"Stream {stream_id_str} status updated to 'active'")
+                    
+                    # Update database status
+                    try:
+                        from app.services.video_stream_service import video_stream_service
+                        await video_stream_service.update_stream_status(
+                            UUID(stream_id_str), 'active', is_streaming=True
+                        )
+                    except Exception as e:
+                        logger.error(f"Error updating DB status for {stream_id_str}: {e}")
+
     def cleanup(self):
         """Cleanup resources."""
         logger.info("Cleaning up StreamProcessingService")
@@ -611,5 +665,6 @@ class StreamProcessingService:
         
         # Shutdown thread pool
         thread_pool.shutdown(wait=False)
+
 
 stream_processing_service = StreamProcessingService()

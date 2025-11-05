@@ -8,16 +8,14 @@ from langchain_core.tools import StructuredTool
 
 from app.config.settings import config
 from app.services.session_service import session_manager
-from app.schemas import ChatRequest, SearchQuery # SearchQuery is key for the tool
-from app.services.qdrant_service import qdrant_service # Import the actual search function and client getter
+from app.schemas import ChatRequest, SearchQuery 
+# from app.services.qdrant_service import qdrant_service  
+from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.utils import (
-    get_workspace_qdrant_collection_name,
-    ensure_workspace_qdrant_collection_exists,
     parse_camera_ids,
     get_ChatOllama_model,
     format_chat_history
 )
-from app.services.workspace_service import workspace_service
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +52,31 @@ async def chat_with_qdrant(
     try:
         logger.info(f"Received Qdrant chat request from user '{username}': {request.model_dump(exclude_none=True)}")
 
-        _ , active_workspace_id_obj = workspace_service.get_user_and_workspace(username)
+        # Get user details and workspace info
+        user_details, active_workspace_id_obj = await qdrant_service.get_user_workspace_info(username)
+        
+        if not user_details:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail="User not found."
+            )
+        
         if not active_workspace_id_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found. Please activate a workspace to use the chat.")
-
-        workspace_collection_name = get_workspace_qdrant_collection_name(active_workspace_id_obj)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail="No active workspace found. Please activate a workspace to use the chat."
+            )
         
-        await ensure_workspace_qdrant_collection_exists(qdrant_service.qdrant_client, active_workspace_id_obj)
+        # Get user roles
+        user_system_role = user_details.get("role", "user")
+        user_id = user_details.get("user_id")
         
-        logger.info(f"User '{username}' interacting with workspace '{active_workspace_id_obj}' (Qdrant collection: '{workspace_collection_name}')")
+        # Get workspace role
+        workspace_membership = await qdrant_service.check_workspace_membership(
+            user_id=user_id,
+            workspace_id=active_workspace_id_obj
+        )
+        user_workspace_role = workspace_membership.get("role")
 
         prompt = request.prompt
         context = request.context or ""
@@ -84,7 +98,7 @@ async def chat_with_qdrant(
                                          end_date: Optional[str] = None, 
                                          start_time: Optional[str] = None, 
                                          end_time: Optional[str] = None) -> str:
-            logger.info(f"LLM tool 'perform_search_wrapper' invoked for collection '{workspace_collection_name}' with args: "
+            logger.info(f"LLM tool 'perform_search_wrapper' invoked for collection '{active_workspace_id_obj}' with args: "
                         f"camera_id={camera_id}, start_date={start_date}, end_date={end_date}, "
                         f"start_time={start_time}, end_time={end_time}")
             
@@ -96,11 +110,23 @@ async def chat_with_qdrant(
                 end_time=end_time
             )
             
-            # Call the imported perform_search function
-            search_result_dict = await workspace_service.perform_search(query, workspace_collection_name)
+            # Call the search_ordered_data function with ALL required parameters
+            search_result_dict = await qdrant_service.search_ordered_data(
+                workspace_id=active_workspace_id_obj,
+                search_query=query,
+                user_system_role=user_system_role,
+                user_workspace_role=user_workspace_role,
+                requesting_username=username,
+                page=1,
+                per_page=100  # Limit to 100 results for the LLM
+            )
             
-            if search_result_dict and search_result_dict.get("results"):
-                limited_results = search_result_dict["results"][:5] # Limit to top 5 for brevity
+            if search_result_dict and search_result_dict.get("data"):
+                results = search_result_dict["data"]
+                total_count = search_result_dict.get("total_count", 0)
+                
+                # Limit to top 5 for brevity in LLM response
+                limited_results = results[:5]
                 
                 formatted_results_for_llm = []
                 for res_idx, res_item in enumerate(limited_results):
@@ -119,10 +145,11 @@ async def chat_with_qdrant(
                     )
                 
                 if not formatted_results_for_llm:
-                     return "No specific records found matching the criteria in your active workspace."
+                    return "No specific records found matching the criteria in your active workspace."
                 
-                summary = (f"Search found {search_result_dict.get('total_count', 0)} records in your active workspace. "
-                           f"Showing a few examples:\n" + "\n".join(formatted_results_for_llm))
+                summary = (f"Search found {total_count} records in your active workspace. "
+                           f"Showing top {len(formatted_results_for_llm)} examples:\n" + 
+                           "\n".join(formatted_results_for_llm))
                 logger.debug(f"Search tool result summary for LLM: {summary}")
                 return summary
             else:
@@ -164,9 +191,9 @@ async def chat_with_qdrant(
                         
                         # Handle potential tool calls if model structures them this way in streaming
                         if hasattr(chunk, 'tool_calls') and chunk.tool_calls:
-                             logger.info(f"Streaming: LLM initiated tool calls: {chunk.tool_calls}")
-                             # or implement the explicit loop of invoking tool and feeding back.
-                             # For now, we primarily stream content.
+                            logger.info(f"Streaming: LLM initiated tool calls: {chunk.tool_calls}")
+                            # or implement the explicit loop of invoking tool and feeding back.
+                            # For now, we primarily stream content.
                         
                         await asyncio.sleep(0.01)
                     logger.info(f"LLM streaming finished. Full response starts with: {full_response_content[:100]}...")
@@ -200,4 +227,3 @@ async def chat_with_qdrant(
     except Exception as e:
         logger.error(f"Error in chat_with_qdrant (user: {username}): {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An internal server error occurred: {str(e)}")
-    

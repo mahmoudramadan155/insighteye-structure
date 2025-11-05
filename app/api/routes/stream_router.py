@@ -12,7 +12,8 @@ from app.config.settings import config
 from app.services.database import db_manager
 from app.services.user_service import user_manager
 from app.services.session_service import session_manager
-from app.services.stream_service import stream_manager, send_ping, _safe_close_websocket, send_ping_with_stability_check, handle_mark_read_message
+from app.services.stream_service import stream_manager
+from app.utils import safe_close_websocket, send_ping, handle_mark_read_message, send_ping_with_stability_check
 from starlette.websockets import WebSocketState
 import concurrent.futures
 import os
@@ -289,7 +290,7 @@ async def websocket_workspace_stream(websocket: WebSocket):
         
         # Close websocket safely only if not already closed
         if not websocket_closed:
-            await _safe_close_websocket(websocket, user_id_for_log)
+            await safe_close_websocket(websocket, user_id_for_log)
 
 @router.websocket("/notify")
 async def websocket_notify(websocket: WebSocket):
@@ -466,7 +467,7 @@ async def websocket_notify(websocket: WebSocket):
                 logging.error(f"Error unsubscribing {username_for_log}: {e_unsub}")
 
         if not websocket_closed:
-            await _safe_close_websocket(websocket, username_for_log)
+            await safe_close_websocket(websocket, username_for_log)
 
 @router.get("/notify")
 async def get_http_notifications(
@@ -851,7 +852,7 @@ async def debug_people_count_cooldown_status(
 
 #         # Close websocket safely only if not already closed
 #         if not websocket_closed:
-#             await _safe_close_websocket(websocket, username_for_log)
+#             await safe_close_websocket(websocket, username_for_log)
         
 #         logging.debug(f"Notify WS: Cleanup completed for {username_for_log or 'unknown'}")
 

@@ -1,5 +1,6 @@
 # app/routes/camera_router.py
 from fastapi import APIRouter, HTTPException, Depends, status, Request, Response, Query, UploadFile, File
+from fastapi.responses import JSONResponse
 from typing import List, Optional, Dict, Union
 import csv
 import io
@@ -13,7 +14,8 @@ from app.schemas import (
     StreamCreate, StreamUpdate, StreamDelete, CameraStreamQueryParams,
     CamerasStateResponse, BulkLocationAssignment, BulkLocationAssignmentResult,
     LocationHierarchyResponse, CameraAlertSettings, CameraGroupResponse,
-    LocationStatsResponseWithAlerts, CameraCSVRecordWithLocationAndAlerts
+    LocationStatsResponseWithAlerts, CameraCSVRecordWithLocationAndAlerts,
+    ThresholdSettings
 )
 from app.services.session_service import session_manager 
 from app.services.user_service import user_manager
@@ -306,6 +308,149 @@ async def delete_streams(
         logger.error(f"Unexpected error in batch deletion: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred during stream deletion.")
 
+
+# ==================== Threshold Management ====================
+
+@router.post("/{stream_id}/thresholds")
+async def update_stream_thresholds(
+    stream_id: str,
+    settings: ThresholdSettings,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Update count thresholds for a specific stream."""
+    try:
+        requester_user_id_str = str(current_user_data["user_id"])
+        stream_id_uuid = UUID(stream_id)
+        
+        # Verify stream exists and user has access
+        stream_info = await db_manager.execute_query(
+            "SELECT workspace_id, name FROM video_stream WHERE stream_id = $1",
+            (stream_id_uuid,), fetch_one=True
+        )
+        
+        if not stream_info:
+            raise HTTPException(status_code=404, detail="Stream not found")
+        
+        # Check workspace membership
+        await check_workspace_access(
+            db_manager,
+            UUID(requester_user_id_str),
+            stream_info['workspace_id'],
+        )
+        
+        # Validate thresholds
+        if (settings.count_threshold_greater is not None and 
+            settings.count_threshold_less is not None and 
+            settings.count_threshold_greater <= settings.count_threshold_less):
+            raise HTTPException(status_code=400, detail="Greater threshold must be higher than less threshold")
+        
+        # Update thresholds
+        await db_manager.execute_query(
+            """UPDATE video_stream 
+               SET count_threshold_greater = $1, count_threshold_less = $2, 
+                   alert_enabled = $3, updated_at = NOW() 
+               WHERE stream_id = $4""",
+            (settings.count_threshold_greater, settings.count_threshold_less,
+             settings.alert_enabled, stream_id_uuid)
+        )
+        
+        return JSONResponse(content={
+            "status": "success",
+            "message": f"Thresholds updated for stream '{stream_info['name']}'",
+            "settings": {
+                "count_threshold_greater": settings.count_threshold_greater,
+                "count_threshold_less": settings.count_threshold_less,
+                "alert_enabled": settings.alert_enabled
+            }
+        })
+        
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid stream ID format")
+    except Exception as e:
+        logger.error(f"Error updating stream thresholds: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{stream_id}/thresholds")
+async def get_stream_thresholds(
+    stream_id: str,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get count thresholds for a specific stream."""
+    try:
+        requester_user_id_str = str(current_user_data["user_id"])
+        stream_id_uuid = UUID(stream_id)
+        
+        # Get stream info with thresholds
+        stream_info = await db_manager.execute_query(
+            """SELECT vs.workspace_id, vs.name, vs.count_threshold_greater, 
+                      vs.count_threshold_less, vs.alert_enabled
+               FROM video_stream vs WHERE vs.stream_id = $1""",
+            (stream_id_uuid,), fetch_one=True
+        )
+        
+        if not stream_info:
+            raise HTTPException(status_code=404, detail="Stream not found")
+        
+        # Check workspace membership
+        await check_workspace_access(
+            db_manager,
+            UUID(requester_user_id_str),
+            stream_info['workspace_id'],
+        )
+        
+        return JSONResponse(content={
+            "status": "success",
+            "stream_id": stream_id,
+            "name": stream_info['name'],
+            "thresholds": {
+                "count_threshold_greater": stream_info.get('count_threshold_greater'),
+                "count_threshold_less": stream_info.get('count_threshold_less'),
+                "alert_enabled": stream_info.get('alert_enabled', False)
+            }
+        })
+        
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid stream ID format")
+    except Exception as e:
+        logger.error(f"Error getting stream thresholds: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@router.get("/{stream_id}")
+async def get_stream_by_id(
+    stream_id: str,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get details for a specific stream."""
+    try:
+        user_id_str = str(current_user_data["user_id"])
+        result = await camera_service.get_stream_by_id(stream_id, user_id_str)
+        return JSONResponse(content={"status": "success", "data": result})
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
+    except Exception as e:
+        logger.error(f"Error getting stream {stream_id}: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
+
+@router.get("/streams")
+async def get_all_workspace_streams_endpoint(
+    workspace_id: Optional[str] = Query(None, description="Specific workspace ID (optional)"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get all streams accessible to the user."""
+    try:
+        user_id_str = str(current_user_data["user_id"])
+        result = await camera_service.get_workspace_streams(user_id_str, workspace_id)
+        return JSONResponse(content={"status": "success", "data": result})
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
+    except Exception as e:
+        logger.error(f"Error getting workspace streams: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
 
 # ==================== CAMERA STATE & INFO ====================
 
