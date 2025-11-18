@@ -14,7 +14,7 @@ from ultralytics import YOLO
 from app.utils import check_workspace_access, send_people_count_alert_email, send_fire_alert_email
 from app.config.settings import config
 from app.services.database import db_manager
-# from app.services.qdrant_service import qdrant_service  
+  
 from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.shared_stream_service import video_file_manager
 import concurrent.futures

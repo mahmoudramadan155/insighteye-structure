@@ -88,7 +88,7 @@ class SharedVideoStream:
             
             return None
     
-    def wait_for_frame(self, timeout: float = 1.0) -> bool:
+    def wait_for_frame(self, timeout: float = 10.0) -> bool:
         """Wait for a new frame to be available"""
         return self.frame_available.wait(timeout)
     

@@ -1,23 +1,21 @@
 # /app/main.py
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-# from fastapi.middleware.trustedhost import TrustedHostMiddleware
-# from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import logging
 import signal
 import uvicorn
 from app.config.settings import config
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 from app.api.routes import router
-from app.services.stream_service import stream_manager, initialize_stream_manager
+from app.services.stream_service_3 import stream_manager, initialize_stream_manager
 
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from app.services.database import (
     init_db_pool, close_db_pool, connection_pool, 
-    initialize_database, ensure_database_indices 
+    get_pool,
+    check_postgres_health
 )
 
 # Setup logging
@@ -29,31 +27,6 @@ logging.basicConfig(
     ])
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler()
-
-async def cleanup_expired_data():
-    """Clean up expired records from various tables."""
-    logger.info("Executing scheduled job: cleanup_expired_data")
-    try:
-        if not connection_pool or connection_pool._closed:
-            logger.warning("cleanup_expired_data: DB pool not available or closed.")
-            return
-
-        async with connection_pool.acquire() as conn:
-            async with conn.transaction():
-                # Clean up expired OTPs
-                await conn.execute("DELETE FROM otps WHERE expires_at < CURRENT_TIMESTAMP")
-                logger.info("Expired OTPs cleaned up.")
-
-                # Clean up expired sessions
-                await conn.execute("DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP")
-                logger.info("Expired sessions cleaned up.")
-
-                # Clean up expired blacklisted tokens
-                await conn.execute("DELETE FROM token_blacklist WHERE expires_at < CURRENT_TIMESTAMP")
-                logger.info("Expired blacklisted tokens cleaned up.")
-    except Exception as e:
-        logger.error(f"Error during cleanup_expired_data: {e}", exc_info=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,18 +40,11 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Database pool initialization failed.") from e
 
     try:
-        logger.info("Attempting to initialize database schema (async)...")
-        if await initialize_database():
-            logger.info("Database schema initialized/verified successfully (async).")
+        healthy = await check_postgres_health()
+        if not healthy:
+            raise RuntimeError("DB health check failed after pool init")
     except Exception as e:
-        logger.critical(f"CRITICAL: Database schema initialization failed (async): {e}", exc_info=True)
-        raise RuntimeError(f"Database schema initialization failed (async): {e}") from e
-
-    try:
-        # await ensure_database_indices()
-        logger.info("Database indices ensured (async).")
-    except Exception as e:
-        logger.error(f"Failed to ensure database indices (async): {e}", exc_info=True)
+        logger.warning("Index/health check failed: %s", e)
 
     try:
         await initialize_stream_manager() 
@@ -86,30 +52,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize StreamManager: {e}", exc_info=True)
 
-    try:
-        scheduler.add_job(
-            cleanup_expired_data,
-            trigger=CronTrigger(hour="*/1"),  # Run every hour
-            id="cleanup_expired_data_job", # Ensure unique ID
-            replace_existing=True
-        )
-        scheduler.start()
-        logger.info("APScheduler started with cleanup_expired_data scheduled.")
-    except Exception as e:
-        logger.error(f"Failed to start APScheduler: {e}", exc_info=True)
 
     logger.info("Application startup complete (async).")
     yield
     # Shutdown
     logger.info("Application shutdown sequence initiated (async)...")
-
-    # APScheduler shutdown
-    if scheduler.running:
-        try:
-            scheduler.shutdown()
-            logger.info("APScheduler shut down successfully.")
-        except Exception as e:
-            logger.error(f"Error during APScheduler shutdown: {e}", exc_info=True)
 
     if stream_manager:
         try:
@@ -142,7 +89,7 @@ class CacheControlMiddleware(BaseHTTPMiddleware):
         return response
 
 app = FastAPI(
-    root_path=config.get("fastapi_root_path", "/insighteye"),
+    # root_path=config.get("fastapi_root_path", "/insighteye"),
     lifespan=lifespan,
     title=config.get("fastapi_title", "InsightEye API"),
     description=config.get("fastapi_description", "API for managing cameras, users, and insights."),
@@ -154,18 +101,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Matches main.py's `allow_origins=["*"],#origins`
+    allow_origins=["*"], 
     allow_credentials=config.get("cors_allow_credentials", True),
     allow_methods=config.get("cors_allow_methods", ["*"]),
     allow_headers=config.get("cors_allow_headers", ["*"]),
     expose_headers=config.get("cors_expose_headers", ["X-Request-ID"])
 )
-
-# # Add trusted hosts middleware - Keep commented to match main.py
-# app.add_middleware(
-#     TrustedHostMiddleware,
-#     allowed_hosts=config.get("trusted_hosts", ["localhost", "127.0.0.1"])
-# )
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next): # Identical to main.py
@@ -195,36 +136,52 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 @app.get("/health", tags=["System"])
-async def health_check(): 
-    """API health check endpoint"""
+async def health_check():
+    """API health check endpoint with detailed diagnostics"""
     db_healthy = False
-    conn_info = "DB pool not checked or inactive"
+    conn_info = "DB pool not initialized"
+    pool_stats = {}
 
-    if connection_pool and not connection_pool._closed:
-        try:
-            async with connection_pool.acquire() as conn:
-                await conn.fetchval("SELECT 1")
-            db_healthy = True
-            conn_info = (f"Asyncpg DB pool healthy (size: {connection_pool.get_size()}, "
-                         f"idle: {connection_pool.get_idle_size()}/{connection_pool.get_max_size()})")
-        except Exception as e:
-            conn_info = f"Asyncpg DB pool error: {str(e)}"
-            logger.warning(f"Health check: Asyncpg DB connection failed - {e}", exc_info=True)
-    elif connection_pool and connection_pool._closed:
-        conn_info = "Asyncpg DB pool is closed."
+    connection_pool = get_pool()
+
+    if connection_pool:
+        if connection_pool._closed:
+            conn_info = "DB pool is closed"
+        else:
+            try:
+                async with connection_pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
+                db_healthy = True
+                pool_stats = {
+                    "size": connection_pool.get_size(),
+                    "idle": connection_pool.get_idle_size(),
+                    "max": connection_pool.get_max_size(),
+                }
+                conn_info = f"DB pool healthy (size: {pool_stats['size']}, idle: {pool_stats['idle']}/{pool_stats['max']})"
+            except Exception as e:
+                conn_info = f"DB pool error: {str(e)}"
+                logger.warning(f"Health check: DB connection failed - {e}", exc_info=True)
     else:
-        conn_info = "Asyncpg DB pool not initialized."
+        conn_info = "DB pool is None"
 
     return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "healthy" if db_healthy else "degraded",
+        "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat(),
         "database_status": conn_info,
-        "db_connection_ok": db_healthy
+        "db_connection_ok": db_healthy,
+        "pool_stats": pool_stats if pool_stats else None,
     }
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        await init_db_pool()  # Ensures retry until DB is ready
+    except Exception as e:
+        logger.error(f"Startup DB connection failed ❌: {e}")
 
 if __name__ == "__main__":
     server_host = config.get("server_host", "0.0.0.0")
-    server_port = config.get("server_port", 8001)
+    server_port = config.get("server_port", 8000)
     reload_app = config.get("debug_reload", False) 
 
     logger.info(f"Starting Uvicorn server on {server_host}:{server_port} with reload: {reload_app}")

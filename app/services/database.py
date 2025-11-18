@@ -94,6 +94,25 @@ async def close_db_pool():
         logger.info("Asyncpg database connection pool closed.")
         connection_pool = None
 
+def get_pool() -> asyncpg.Pool:
+    if not connection_pool or connection_pool._closed:
+        raise RuntimeError("DB pool not initialized")
+    return connection_pool
+
+def is_pool_healthy() -> bool:
+    """Check if the connection pool is healthy."""
+    return connection_pool is not None and not connection_pool._closed
+
+async def check_postgres_health() -> bool:
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return True
+    except Exception as e:
+        logger.warning("Postgres health check failed: %s", e)
+        return False
+
 class DatabaseManager:
     """Manages async database connections and queries with connection pooling."""
 
@@ -215,204 +234,3 @@ class DatabaseManager:
                 return await _execute(conn)
 
 db_manager = DatabaseManager()
-
-async def initialize_database():
-    """Initialize the database with the InsightEye schema using asyncpg."""
-    # current_dir = os.path.dirname(os.path.abspath(__file__))
-    # sql_file_path = os.path.join(current_dir, "insighteye-query_v1.2.sql")
-    sql_file_path = config["sql_file_path"]
-
-    validate_db_config(config)
-    DB_HOST = config['database'].get('host', 'localhost')
-    DB_PORT = config['database'].get('port', '5432')
-    POSTGRES_DB = config['database'].get('dbname', 'appdb')
-    DB_USER = config['database'].get('user', 'postgres')
-    POSTGRES_PASSWORD = config['database'].get('password', 'postgres')
-
-    conn: Optional[asyncpg.Connection] = None
-    try:
-        with open(sql_file_path, 'r') as sql_file:
-            sql_content = sql_file.read()
-
-        conn = await asyncpg.connect(host=DB_HOST, port=DB_PORT, database=POSTGRES_DB, user=DB_USER, password=POSTGRES_PASSWORD)
-        await setup_asyncpg_connection_types(conn) # Ensure types are set up on this direct connection too
-        logger.info(f"Executing SQL file for schema initialization: {sql_file_path}")
-        async with conn.transaction():
-            await conn.execute(sql_content)
-        logger.info("Database schema successfully initialized/verified with asyncpg.")
-        return True
-    except FileNotFoundError:
-        logger.error(f"SQL schema file not found: {sql_file_path}")
-        raise
-    except asyncpg.PostgresError as e:
-        logger.error(f"Error initializing database schema with asyncpg: {e}", exc_info=True)
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error during schema initialization with asyncpg: {e}", exc_info=True)
-        raise
-    finally:
-        if conn and not conn.is_closed():
-            await conn.close()
-
-def quote_identifier(identifier):
-    """Quote SQL identifier if needed."""
-    # Check if identifier needs quoting (contains special chars or is a reserved word)
-    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
-        return identifier
-    else:
-        # Escape any double quotes and wrap in double quotes
-        escaped = identifier.replace('"', '""')
-        return f'"{escaped}"'
-
-async def drop_all_tables():
-    """Drops ALL application tables. EXTREMELY DANGEROUS."""
-    tables_to_drop = [
-        "security_events", "logs", "token_blacklist", "otps",
-        "notifications", "sessions", "user_tokens", "param_stream",
-        "video_stream", "workspace_members", "user_accounts", "workspaces", "users"
-    ]
-
-    db_manager = DatabaseManager()
-    dropped_tables = []
-    errors = {}
-
-    try:
-        async with db_manager.transaction() as conn: # conn is an asyncpg.Connection here
-            for table_name in tables_to_drop:
-                try:
-                    # Use our custom quote_identifier function
-                    query = f"DROP TABLE IF EXISTS {quote_identifier(table_name)} CASCADE"
-                    await conn.execute(query)
-                    logger.info(f"Table '{table_name}' dropped successfully (async).")
-                    dropped_tables.append(table_name)
-                except asyncpg.PostgresError as db_err_inner: # Catch specific asyncpg errors
-                    logger.error(f"PostgresError dropping table '{table_name}' (async): {db_err_inner}")
-                    errors[table_name] = str(db_err_inner)
-                    # For a "drop all" operation, we might want to continue on error for one table
-                    # or stop. Current logic re-raises, stopping the whole process.
-                    # If continuing: pass
-                    raise # Re-raise to stop the process as per original logic's intent via HTTPException
-                except Exception as e_inner: # Catch other unexpected errors
-                    logger.error(f"Generic error dropping table '{table_name}' (async): {e_inner}")
-                    errors[table_name] = str(e_inner)
-                    raise # Re-raise
-        return {"message": "All tables dropped (async)", "dropped": dropped_tables, "errors": errors or "None"}
-    except asyncpg.PostgresError as db_e: # Catch errors from transaction or higher level
-        logger.error(f"Failed to drop tables due to PostgresError: {db_e}", exc_info=True)
-        detail = {"message": f"PostgresError during table drop: {str(db_e)}", "collected_errors_before_failure": errors}
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
-    except Exception as e:
-        logger.error(f"Error during async drop_all_tables operation: {str(e)}", exc_info=True)
-        detail_msg = {"message": "Internal error during async table drop operation.", "collected_errors_before_failure": errors}
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail_msg)
-
-async def ensure_database_indices():
-    """Ensure all necessary database indices exist (async)."""
-    indices = [
-        # Workspace indices for name lookups and activity status
-        "CREATE INDEX IF NOT EXISTS idx_workspaces_name ON workspaces(name)",
-        # User indices for username, email, and role-based queries
-        "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username) INCLUDE (user_id, role, is_active)",
-        "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email) INCLUDE (user_id)",
-        # OTP indices for expiration and user-based queries
-        "CREATE INDEX IF NOT EXISTS idx_otps_expires_at ON otps(expires_at)",
-        "CREATE INDEX IF NOT EXISTS idx_otps_email_purpose ON otps(email, purpose)", # Added from schema, good for lookups
-        # Security event indices for user, event type, and timestamp filtering
-        "CREATE INDEX IF NOT EXISTS idx_security_events_user_id ON security_events(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_security_events_event_type ON security_events(event_type)",
-        "CREATE INDEX IF NOT EXISTS idx_security_events_created_at ON security_events(created_at)", # Changed from timestamp
-        # Log indices for user, status, and timestamp filtering
-        "CREATE INDEX IF NOT EXISTS idx_logs_user_id ON logs(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_logs_status ON logs(status)",
-        "CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at)",
-        # Token blacklist index for JTI lookups and user_id
-        "CREATE INDEX IF NOT EXISTS idx_token_blacklist_user_id_expires ON token_blacklist(user_id, expires_at)", # from schema
-        # Notification indices for user and read status
-        "CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)",
-        # Session indices for user and expiration
-        "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)",
-        # User token indices for user and token type
-        "CREATE INDEX IF NOT EXISTS idx_user_tokens_user_id ON user_tokens(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_user_tokens_is_active_refresh_exp ON user_tokens(is_active, refresh_expires_at)", # from schema
-        # Parameter stream index for user
-        "CREATE INDEX IF NOT EXISTS idx_param_stream_user_id ON param_stream(user_id)", # from original code
-        "CREATE INDEX IF NOT EXISTS idx_param_stream_workspace_id_unique ON param_stream(workspace_id)", # From schema (param_stream_workspace_unique)
-        # Workspace member indices for workspace and user lookups
-        "CREATE INDEX IF NOT EXISTS idx_workspace_members_workspace_id ON workspace_members(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_workspace_members_user_id ON workspace_members(user_id)",
-        # User account index for user_id lookups
-        "CREATE INDEX IF NOT EXISTS idx_user_accounts_user_id ON user_accounts(user_id)", # from original code
-        # Video stream indices for user and streaming status
-        "CREATE INDEX IF NOT EXISTS idx_video_stream_user_id ON video_stream(user_id)", # from original code
-        "CREATE INDEX IF NOT EXISTS idx_video_stream_is_streaming ON video_stream(is_streaming)", # from original code
-        # Indices from the provided SQL schema file (ensure they are covered or add them)
-        "CREATE INDEX IF NOT EXISTS idx_workspaces_is_active ON workspaces(is_active)",
-        "CREATE INDEX IF NOT EXISTS idx_workspace_members_role ON workspace_members(role)",
-        "CREATE INDEX IF NOT EXISTS idx_workspace_members_ws_user_role ON workspace_members(workspace_id, user_id, role)",
-        "CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)",
-        "CREATE INDEX IF NOT EXISTS idx_users_last_login ON users(last_login DESC NULLS LAST) WHERE last_login IS NOT NULL",
-        "CREATE INDEX IF NOT EXISTS idx_video_stream_workspace_id ON video_stream(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_video_stream_status ON video_stream(status)",
-        "CREATE INDEX IF NOT EXISTS idx_video_stream_ws_user ON video_stream(workspace_id, user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_video_stream_active_workspace ON video_stream(workspace_id, status) WHERE is_streaming = TRUE",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_workspace_id ON sessions(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(user_id, expires_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_user_tokens_workspace_id ON user_tokens(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_user_tokens_refresh_token ON user_tokens(refresh_token) WHERE is_active = TRUE",
-        "CREATE INDEX IF NOT EXISTS idx_user_tokens_access_token ON user_tokens(access_token) WHERE is_active = TRUE",
-        "CREATE INDEX IF NOT EXISTS idx_user_tokens_active_user_refresh_exp ON user_tokens(user_id, refresh_expires_at DESC) WHERE is_active = TRUE",
-        "CREATE INDEX IF NOT EXISTS idx_token_blacklist_token ON token_blacklist(token)", # Covered
-        "CREATE INDEX IF NOT EXISTS idx_token_blacklist_user_id ON token_blacklist(user_id)", # Covered by user_id_expires
-        "CREATE INDEX IF NOT EXISTS idx_logs_workspace_id ON logs(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_logs_action_type_created_at ON logs(action_type, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_logs_status_created_at ON logs(status, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_security_events_workspace_id ON security_events(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_security_events_event_type_created_at ON security_events(event_type, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_security_events_severity_created_at ON security_events(severity, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_notifications_workspace_id ON notifications(workspace_id)",
-        "CREATE INDEX IF NOT EXISTS idx_notifications_stream_id ON notifications(stream_id)",
-        "CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, is_read) WHERE is_read = FALSE",
-        "CREATE INDEX IF NOT EXISTS idx_notifications_ws_user_read ON notifications(workspace_id, user_id, is_read)",
-    ]
-    # Remove duplicates by converting to set and back to list
-    # unique_indices = sorted(list(set(indices)))
-    unique_indices = list(dict.fromkeys(indices))  # Preserves order, removes duplicates
-
-
-    validate_db_config(config)
-    DB_HOST = config['database'].get('host', 'localhost')
-    DB_PORT = config['database'].get('port', '5432')
-    POSTGRES_DB = config['database'].get('dbname', 'appdb')
-    DB_USER = config['database'].get('user', 'postgres')
-    POSTGRES_PASSWORD = config['database'].get('password', 'postgres')
-    conn: Optional[asyncpg.Connection] = None
-    errors = []
-    try:
-        conn = await asyncpg.connect(host=DB_HOST, port=DB_PORT, database=POSTGRES_DB, user=DB_USER, password=POSTGRES_PASSWORD)
-        logger.info("Starting database index verification/creation...")
-        # async with conn.transaction():
-        for i, index_stmt in enumerate(unique_indices):
-            try:
-                await conn.execute(index_stmt)
-                # Extract index name for logging, be robust if format varies
-                index_name_part = index_stmt.split("CREATE INDEX IF NOT EXISTS ")[1].split(" ON ")[0] if "CREATE INDEX IF NOT EXISTS " in index_stmt else "Unknown Index"
-                logger.debug(f"Index statement {i+1}/{len(unique_indices)} executed: {index_name_part}...")
-            except asyncpg.PostgresError as e:
-                index_name_part_err = index_stmt.split("CREATE INDEX IF NOT EXISTS ")[1].split(" ON ")[0] if "CREATE INDEX IF NOT EXISTS " in index_stmt else "Unknown Index"
-                logger.error(f"Error executing index statement '{index_name_part_err}': {e}")
-                errors.append(f"Index '{index_name_part_err}': {str(e)}")
-
-        logger.info("Database indices have been successfully verified/created (async).")
-        if errors:
-            logger.warning(f"Some non-critical errors occurred during index creation: {errors}")
-
-    except asyncpg.PostgresError as e:
-        logger.error(f"Error creating database indices (async): {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to create database indices: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error during index creation (async): {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Unexpected error during index creation")
-    finally:
-        if conn and not conn.is_closed():
-            await conn.close()

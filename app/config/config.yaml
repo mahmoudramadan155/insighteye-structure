@@ -83,14 +83,14 @@ insert_interval: 60 #seconds
 
 DATA_BACKEND: elasticsearch
 
-qdrant_url: "qdrant"
+qdrant_url: "172.31.25.133"
 qdrant_port: 6333
 qdrant_collection_name: "person_counts"
 query_timeout: 50
 qdrant_fetch_limit: 50
 qdrant_vector_size: 1
 
-elasticsearch_hosts: "http://elasticsearch:9200"
+elasticsearch_hosts: "http://172.31.25.133:9200"
 elasticsearch_index_name: person_counts
 elasticsearch_timeout: 60.0
 elasticsearch_version: 8
@@ -101,7 +101,7 @@ database:
   dbname: "insighteye_db"
   user: "insighteye_user"
   password: "insighteye*+#@"
-  host: "postgres"
+  host: "172.31.25.133"
   port: "5432"
 
 server_host: "127.0.0.1"
@@ -205,3 +205,15 @@ short_video_optimization: true
 
 people_count_cooldown_duration_seconds: 300
 enable_people_count_email_alerts: true
+
+STREAM_HEALTHCHECK_INTERVAL_SECONDS: 120
+STREAM_STALE_THRESHOLD_SECONDS: 300 
+STREAM_START_STAGGER_DELAY: 2.0
+SHARED_STREAM_FRAME_WAIT_TIMEOUT: 15.0 
+
+# RTSP-specific settings
+RTSP_CONNECTION_TIMEOUT: 30  # seconds
+RTSP_READ_TIMEOUT: 30  # seconds
+RTSP_RECONNECT_ATTEMPTS: 10  # More attempts for network streams
+RTSP_TRANSPORT: tcp  # "tcp" or "udp" - TCP is more reliable
+RTSP_BUFFER_SIZE: 1  # Keep small for low latency

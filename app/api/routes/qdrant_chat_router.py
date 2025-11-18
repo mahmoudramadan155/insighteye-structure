@@ -9,7 +9,7 @@ from langchain_core.tools import StructuredTool
 from app.config.settings import config
 from app.services.session_service import session_manager
 from app.schemas import ChatRequest, SearchQuery 
-# from app.services.qdrant_service import qdrant_service  
+  
 from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.utils import (
     parse_camera_ids,

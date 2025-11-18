@@ -2,7 +2,7 @@
 import logging
 from typing import Any, Dict, Optional, List
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from app.services.database import db_manager
 
@@ -125,6 +125,27 @@ class FireDetectionService:
             logger.info(f"Cleared fire detection state for stream {stream_id}")
         
         return result
+
+    async def cleanup_old_fire_states(self):
+        """Clean up old fire detection states"""
+        try:
+            await self.db_manager.execute_query(
+                """DELETE FROM fire_detection_state 
+                WHERE stream_id NOT IN (SELECT stream_id FROM video_stream)"""
+            )
+            
+            day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+            await self.db_manager.execute_query(
+                """UPDATE fire_detection_state 
+                SET fire_status = 'no detection', last_notification_time = NULL 
+                WHERE last_notification_time < $1""",
+                (day_ago,)
+            )
+            
+            logger.debug("Cleaned up old fire detection states")
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up fire states: {e}")
 
     async def get_fire_detection_history(
         self,

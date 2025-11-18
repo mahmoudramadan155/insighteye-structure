@@ -8,7 +8,6 @@ from app.services.user_service import user_manager
 from app.schemas import SQLQueryRequest, SQLQueryResponse, CreateUserRequest, VerifyPasswordRequest, ResetPasswordRequest, EmailRequest, UserRequest 
 import logging
 import asyncpg
-from app.services.database import drop_all_tables as db_drop_all_tables_func
 
 logger = logging.getLogger(__name__)
 
@@ -521,27 +520,3 @@ async def execute_sql_query_route(
             status="failure"
         )
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {str(e)}")
-
-@router.delete("/drop_tables", status_code=status.HTTP_200_OK)
-async def drop_all_tables_endpoint(
-    request: FastAPIRequest,
-    current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Drop all database tables (admin only - CRITICAL operation)."""
-    try:
-        if current_admin_data.get("role") != 'admin':
-            logger.warning(f"Unauthorized attempt to drop tables by user: {current_admin_data.get('username', 'unknown_user')}")
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin privileges required.")
-    
-        user_id_str = str(current_admin_data["user_id"])
-        username = current_admin_data["username"]
-        logger.critical(f"ADMIN ACTION: User '{username}' (ID: {user_id_str}) initiated DROP ALL TABLES.")
-    
-        result = await db_drop_all_tables_func()
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error during drop_all_tables endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error during table drop.")

@@ -8,7 +8,7 @@ from fastapi import HTTPException, status
 
 from app.services.database import db_manager
 from app.services.user_service import user_manager
-# from app.services.qdrant_service import qdrant_service  
+  
 from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.workspace_service import workspace_service
 from app.utils import (

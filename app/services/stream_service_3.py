@@ -18,7 +18,7 @@ from app.services.people_count_service import people_count_service
 from app.services.notification_service import notification_service
 from app.services.video_stream_service import video_stream_service
 from app.services.parameter_service import parameter_service
-# from app.services.qdrant_service import qdrant_service  
+  
 from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.workspace_service import workspace_service
 from app.services.shared_stream_service import video_file_manager
@@ -1276,90 +1276,119 @@ class StreamManager:
                 # Clean websocket connections
                 await self._clean_websocket_connections()
 
-                # Clean up expired cooldowns
                 current_time = time.time()
-                
-                # Fire cooldowns (24 hour expiry)
-                fire_cooldown_expiry = 86400
-                expired_fire_cooldowns = [
-                    stream_id for stream_id, last_time in list(self.fire_detection_states.items())
-                    if (current_time - last_time) > fire_cooldown_expiry 
-                       and stream_id not in self.active_streams
-                ]
+
+                # ==========================
+                # Cleanup Fire Cooldowns
+                # ==========================
+                fire_cooldown_expiry = 86400  # 24 hours
+                expired_fire_cooldowns = []
+
+                for stream_id, last_time in list(self.fire_detection_states.items()):
+                    try:
+                        last_time_f = float(last_time)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid fire timestamp for {stream_id}, removing: {last_time}")
+                        self.fire_detection_states.pop(stream_id, None)
+                        continue
+
+                    if (current_time - last_time_f) > fire_cooldown_expiry and stream_id not in self.active_streams:
+                        expired_fire_cooldowns.append(stream_id)
+
                 for key in expired_fire_cooldowns:
                     self.fire_detection_states.pop(key, None)
-                
-                # People count cooldowns (24 hour expiry)
+
+                # ==========================
+                # Cleanup People Count Cooldowns
+                # ==========================
                 people_cooldown_expiry = 86400
-                expired_people_cooldowns = [
-                    stream_id for stream_id, last_time 
-                    in list(self.people_count_notification_cooldowns.items())
-                    if (current_time - last_time) > people_cooldown_expiry 
-                       and stream_id not in self.active_streams
-                ]
+                expired_people_cooldowns = []
+
+                for stream_id, last_time in list(self.people_count_notification_cooldowns.items()):
+                    try:
+                        last_time_f = float(last_time)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid people timestamp for {stream_id}, removing: {last_time}")
+                        self.people_count_notification_cooldowns.pop(stream_id, None)
+                        continue
+
+                    if (current_time - last_time_f) > people_cooldown_expiry and stream_id not in self.active_streams:
+                        expired_people_cooldowns.append(stream_id)
+
                 for key in expired_people_cooldowns:
                     self.people_count_notification_cooldowns.pop(key, None)
-                
-                # Clean up old fire states in database
+
+                # ==========================
+                # Database Cleanup
+                # ==========================
                 await self.fire_service.cleanup_old_fire_states()
 
-                # Clean up orphaned workspace registrations
+                # ==========================
+                # Cleanup orphaned workspace registrations
+                # ==========================
+                orphaned_total = 0
+
                 async with self._lock:
                     for workspace_id_str in list(self.workspace_streams.keys()):
-                        # Remove streams that are no longer active
                         active_stream_ids = self.workspace_streams[workspace_id_str]
-                        orphaned = [
-                            sid for sid in active_stream_ids 
-                            if sid not in self.active_streams
-                        ]
+                        orphaned = [sid for sid in active_stream_ids if sid not in self.active_streams]
+
                         for sid in orphaned:
                             self.workspace_streams[workspace_id_str].discard(sid)
                             self.stream_workspaces.pop(sid, None)
-                        
-                        # Remove empty workspace entries
+                            orphaned_total += 1
+
                         if not self.workspace_streams[workspace_id_str]:
                             del self.workspace_streams[workspace_id_str]
                             logger.debug(f"Removed empty workspace registry: {workspace_id_str}")
 
-                # Clean up orphaned shared stream registry
+                # ==========================
+                # Cleanup shared stream registry
+                # ==========================
                 for source in list(self._shared_stream_registry.keys()):
                     stream_ids = self._shared_stream_registry[source]
-                    active_ids = [sid for sid in stream_ids if sid in self.active_streams]
-                    
-                    if not active_ids:
+                    active_only = [sid for sid in stream_ids if sid in self.active_streams]
+
+                    if not active_only:
                         del self._shared_stream_registry[source]
                         logger.debug(f"Removed orphaned shared stream registry: {source}")
                     else:
-                        self._shared_stream_registry[source] = set(active_ids)
+                        self._shared_stream_registry[source] = set(active_only)
 
-                # Clean up old error records (keep last 100)
+                # ==========================
+                # Cleanup old error records
+                # ==========================
                 for stream_id in list(self.stream_errors.keys()):
+                    # keep last 100 errors only
                     if len(self.stream_errors[stream_id]) > 100:
                         self.stream_errors[stream_id] = self.stream_errors[stream_id][-100:]
-                    
-                    # Remove error records for streams inactive for > 1 day
+
+                    # remove error history older than 24 hours for inactive streams
                     if stream_id not in self.active_streams:
                         last_error = self.stream_errors[stream_id][-1] if self.stream_errors[stream_id] else None
                         if last_error:
                             age = (datetime.now(timezone.utc) - last_error['timestamp']).total_seconds()
-                            if age > 86400:  # 24 hours
+                            if age > 86400:
                                 del self.stream_errors[stream_id]
 
+                # ==========================
+                # Logging Summary
+                # ==========================
                 cleanup_summary = {
                     'fire_cooldowns': len(expired_fire_cooldowns),
                     'people_cooldowns': len(expired_people_cooldowns),
-                    'orphaned_registrations': len(orphaned) if 'orphaned' in locals() else 0
+                    'orphaned_registrations': orphaned_total,
                 }
-                
+
                 if any(cleanup_summary.values()):
                     logger.debug(f"🧹 Cleanup summary: {cleanup_summary}")
 
             except asyncio.CancelledError:
-                logging.info("Periodic cleanup task cancelled")
+                logger.info("Periodic cleanup task cancelled")
                 break
             except Exception as e:
-                logging.error(f"Error in periodic cleanup: {e}", exc_info=True)
-            
+                logger.error(f"Error in periodic cleanup: {e}", exc_info=True)
+
             await asyncio.sleep(config.get("stream_cleanup_interval_seconds", 60.0))
 
     async def _clean_websocket_connections(self):

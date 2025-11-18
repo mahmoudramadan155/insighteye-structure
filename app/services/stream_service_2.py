@@ -15,7 +15,7 @@ from app.services.people_count_service import people_count_service
 from app.services.notification_service import notification_service
 from app.services.video_stream_service import video_stream_service
 from app.services.parameter_service import parameter_service
-# from app.services.qdrant_service import qdrant_service
+
 from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.shared_stream_service import video_file_manager
 from app.services.stream_processing_service import stream_processing_service
@@ -218,23 +218,26 @@ class StreamManager:
         logging.info("StreamManager shutdown complete.")
 
     # ==================== Stream Lifecycle ====================
-
+    
     async def start_stream_background(self, stream_id: UUID, owner_id: UUID, owner_username: str,
-                                     camera_name: str, source: str, workspace_id: UUID,
-                                     location_info: Optional[Dict[str, Any]] = None):
-        """Start stream processing in background."""
+                                    camera_name: str, source: str, workspace_id: UUID,
+                                    location_info: Optional[Dict[str, Any]] = None):
+        """Start stream processing in background with proper initialization."""
         stream_id_str = str(stream_id)
+        current_time = datetime.now(timezone.utc)
         
         async with self._lock:
             if stream_id_str in self.active_streams:
                 logging.info(f"Stream {stream_id_str} already active or being started.")
                 return
             
-            # Initialize with 'starting' status
+            # Initialize with all timing fields
             self.active_streams[stream_id_str] = {
                 'status': 'starting',
                 'task': None,
-                'start_time': datetime.now(timezone.utc),
+                'start_time': current_time,
+                'last_heartbeat': current_time,  # NEW: Initialize heartbeat
+                'last_frame_time': None,
                 'location_info': location_info or {},
                 'source': source,
                 'camera_name': camera_name,
@@ -253,10 +256,10 @@ class StreamManager:
                 "frames_processed": 0,
                 "detection_count": 0,
                 "avg_processing_time": 0.0,
-                "last_updated": datetime.now(timezone.utc)
+                "last_updated": current_time
             }
 
-            # Create processing task using the processing service
+            # Create processing task
             task = asyncio.create_task(
                 self.processing_service.process_stream_with_sharing(
                     stream_id=stream_id,
@@ -271,12 +274,10 @@ class StreamManager:
             )
             task.set_name(f"process_stream_{stream_id_str}")
 
-            # Add done callback to detect task failures
             def task_done_callback(t):
                 try:
                     if t.exception():
                         logging.error(f"Stream processing task for {stream_id_str} failed: {t.exception()}", exc_info=t.exception())
-                        # Mark stream as error in database
                         asyncio.create_task(self._handle_stream_task_failure(stream_id_str, stream_id, workspace_id, owner_id, camera_name))
                     elif t.cancelled():
                         logging.info(f"Stream processing task for {stream_id_str} was cancelled")
@@ -293,7 +294,8 @@ class StreamManager:
                         'stop_event': stop_event,
                         'clients': set(),
                         'latest_frame': None,
-                        'last_frame_time': datetime.now(timezone.utc),
+                        'last_frame_time': current_time,  # Set initial frame time
+                        'last_heartbeat': current_time,   # Ensure heartbeat is set
                         'task': task,
                         'status': 'active_pending',  
                     })
@@ -319,7 +321,7 @@ class StreamManager:
                 stream_id=stream_id,
                 camera_name=camera_name
             )
-
+            
     async def _stop_stream(self, stream_id_str: str, for_restart: bool = False):
         """Stop a stream."""
         async with self._lock:
@@ -392,6 +394,33 @@ class StreamManager:
         finally:
             self.stream_processing_stats.pop(stream_id_str, None)
 
+
+    async def start_multiple_streams_staggered(self, streams_to_start: List[Dict], stagger_delay: float = 2.0):
+        """Start multiple streams with staggered delays to prevent resource contention."""
+        logger.info(f"Starting {len(streams_to_start)} streams with {stagger_delay}s stagger delay")
+        
+        for i, stream_data in enumerate(streams_to_start):
+            try:
+                await self.start_stream_background(
+                    stream_id=stream_data['stream_id'],
+                    owner_id=stream_data['owner_id'],
+                    owner_username=stream_data['owner_username'],
+                    camera_name=stream_data['camera_name'],
+                    source=stream_data['source'],
+                    workspace_id=stream_data['workspace_id'],
+                    location_info=stream_data.get('location_info')
+                )
+                
+                # Stagger the starts
+                if i < len(streams_to_start) - 1:  # Don't wait after the last one
+                    await asyncio.sleep(stagger_delay)
+                    
+            except Exception as e:
+                logger.error(f"Error starting stream {stream_data.get('stream_id')}: {e}", exc_info=True)
+                continue
+        
+        logger.info(f"Completed starting {len(streams_to_start)} streams")
+        
     # ==================== Stream Management Loop ====================
 
     async def manage_streams_with_deduplication(self):
@@ -537,13 +566,13 @@ class StreamManager:
                 # Clean up expired cooldowns
                 current_time = time.time()
                 
-                # Fire cooldowns
-                expired_fire_cooldowns = [
-                    stream_id for stream_id, last_time in list(self.fire_notification_cooldowns.items())
-                    if (current_time - last_time) > 86400 and stream_id not in self.active_streams
-                ]
-                for key in expired_fire_cooldowns:
-                    del self.fire_notification_cooldowns[key]
+                # # Fire cooldowns
+                # expired_fire_cooldowns = [
+                #     stream_id for stream_id, last_time in list(self.fire_notification_cooldowns.items())
+                #     if (current_time - last_time) > 86400 and stream_id not in self.active_streams
+                # ]
+                # for key in expired_fire_cooldowns:
+                #     del self.fire_notification_cooldowns[key]
                 
                 # People count cooldowns
                 expired_people_cooldowns = [
@@ -553,11 +582,11 @@ class StreamManager:
                 for key in expired_people_cooldowns:
                     del self.people_count_notification_cooldowns[key]
                 
-                # Clean up old fire states in database
+                # # Clean up old fire states in database
                 await self.fire_service.cleanup_old_fire_states()
 
-                if expired_fire_cooldowns or expired_people_cooldowns:
-                    logging.debug(f"Cleaned up {len(expired_fire_cooldowns)} fire and {len(expired_people_cooldowns)} people cooldowns")
+                # if expired_fire_cooldowns or expired_people_cooldowns:
+                #     logging.debug(f"Cleaned up {len(expired_fire_cooldowns)} fire and {len(expired_people_cooldowns)} people cooldowns")
 
             except asyncio.CancelledError:
                 logging.info("Periodic cleanup task cancelled.")
@@ -587,16 +616,20 @@ class StreamManager:
     # ==================== Health Check ====================
 
     async def _check_stream_health(self):
-        """Check health of active streams and restart if needed."""
+        """Check health of active streams using both frame time and heartbeat."""
         async with self._health_lock:
-            if (datetime.now(timezone.utc) - self.last_healthcheck).total_seconds() <= self.healthcheck_interval / 2:
+            current_time_utc = datetime.now(timezone.utc)
+            
+            time_since_last_check = (current_time_utc - self.last_healthcheck).total_seconds()
+            if time_since_last_check < self.healthcheck_interval:
                 return
 
-            current_time_utc = datetime.now(timezone.utc)
             streams_to_restart_ids = []
             
             async with self._lock:
                 active_stream_ids_copy = list(self.active_streams.keys())
+
+            logger.info(f"Health check starting for {len(active_stream_ids_copy)} active streams")
 
             for stream_id_str in active_stream_ids_copy:
                 try:
@@ -607,7 +640,7 @@ class StreamManager:
                     )
 
                     if not db_stream_state or not db_stream_state.get('is_streaming', False):
-                        logging.info(f"Health check: Stream {stream_id_str} externally stopped.")
+                        logger.info(f"Health check: Stream {stream_id_str} externally stopped.")
                         await self._stop_stream(stream_id_str, for_restart=False)
                         continue
                     
@@ -617,28 +650,72 @@ class StreamManager:
                     if not stream_info_mem:
                         continue
 
-                    last_activity_time_mem = stream_info_mem.get('last_frame_time') or stream_info_mem.get('start_time')
-                    time_since_last_frame = float('inf')
+                    stream_status = stream_info_mem.get('status')
                     
-                    if last_activity_time_mem:
-                        if last_activity_time_mem.tzinfo is None:
-                            last_activity_time_mem = last_activity_time_mem.replace(tzinfo=timezone.utc)
-                        time_since_last_frame = (current_time_utc - last_activity_time_mem).total_seconds()
+                    # Check startup time
+                    if stream_status in ['starting', 'active_pending']:
+                        start_time = stream_info_mem.get('start_time')
+                        if start_time:
+                            if start_time.tzinfo is None:
+                                start_time = start_time.replace(tzinfo=timezone.utc)
+                            time_since_start = (current_time_utc - start_time).total_seconds()
+                            
+                            if time_since_start < 60:
+                                logger.debug(f"Stream {stream_id_str} still starting ({time_since_start:.1f}s)")
+                                continue
+                            else:
+                                logger.warning(f"Stream {stream_id_str} stuck in '{stream_status}' for {time_since_start:.1f}s")
+                                streams_to_restart_ids.append(stream_id_str)
+                                continue
 
-                    stale_threshold = config.get("stream_stale_threshold_seconds", 120.0)
-                    if time_since_last_frame > stale_threshold:
-                        logging.warning(f"Stream {stream_id_str} frozen. Queuing for restart.")
+                    # NEW: Check heartbeat first (more recent indicator)
+                    last_heartbeat = stream_info_mem.get('last_heartbeat')
+                    last_frame_time = stream_info_mem.get('last_frame_time')
+                    start_time = stream_info_mem.get('start_time')
+                    
+                    # Use the most recent timestamp
+                    last_activity = last_heartbeat or last_frame_time or start_time
+                    
+                    time_since_last_activity = float('inf')
+                    if last_activity:
+                        if last_activity.tzinfo is None:
+                            last_activity = last_activity.replace(tzinfo=timezone.utc)
+                        time_since_last_activity = (current_time_utc - last_activity).total_seconds()
+
+                    # Increased threshold to 180 seconds (3 minutes)
+                    stale_threshold = config.get("stream_stale_threshold_seconds", 180.0)
+                    
+                    if time_since_last_activity > stale_threshold:
+                        logger.warning(
+                            f"Stream {stream_id_str} appears frozen. "
+                            f"Status: {stream_status}, "
+                            f"Time since last activity: {time_since_last_activity:.1f}s, "
+                            f"Last heartbeat: {last_heartbeat}, "
+                            f"Last frame: {last_frame_time}, "
+                            f"Threshold: {stale_threshold}s. "
+                            f"Queuing for restart."
+                        )
                         streams_to_restart_ids.append(stream_id_str)
-                        
+                    else:
+                        logger.debug(
+                            f"Stream {stream_id_str} healthy. "
+                            f"Status: {stream_status}, "
+                            f"Last activity: {time_since_last_activity:.1f}s ago"
+                        )
+                            
                 except Exception as e:
                     logger.error(f"Error during health check for stream {stream_id_str}: {e}", exc_info=True)
 
+            if streams_to_restart_ids:
+                logger.warning(f"Health check: Restarting {len(streams_to_restart_ids)} frozen streams")
+            
             for stream_id_to_restart_str in streams_to_restart_ids:
-                logging.info(f"Health check: Restarting frozen stream: {stream_id_to_restart_str}")
+                logger.info(f"Health check: Restarting frozen stream: {stream_id_to_restart_str}")
                 await self._stop_stream(stream_id_to_restart_str, for_restart=True)
             
-            self.last_healthcheck = datetime.now(timezone.utc)
-
+            self.last_healthcheck = current_time_utc
+            logger.info(f"Health check completed. Next check in {self.healthcheck_interval}s")
+            
     # ==================== Helper Methods ====================
 
     async def _ensure_collection_for_stream_workspace(self, workspace_id: UUID):

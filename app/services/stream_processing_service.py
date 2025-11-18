@@ -1,6 +1,7 @@
 # app/services/stream_processing_service.py
 """
 Stream Processing Service - Handles video frame processing, object detection, and alerts.
+Now includes Qdrant data storage after each detection.
 """
 import asyncio
 import logging
@@ -17,6 +18,7 @@ import os
 from app.config.settings import config
 from app.utils import send_people_count_alert_email, send_fire_alert_email
 from app.services.database import db_manager
+from app.services.user_service import user_manager
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +271,54 @@ class StreamProcessingService:
             logger.error(f"Error validating source {source}: {e}")
             return False
 
+    async def _save_detection_to_qdrant(
+        self,
+        stream_id_str: str,
+        camera_name: str,
+        owner_username: str,
+        person_count: int,
+        male_count: int,
+        female_count: int,
+        fire_status: str,
+        frame: np.ndarray,
+        workspace_id: UUID,
+        location_info: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Save detection data to Qdrant database.
+        This is called periodically based on frame_skip configuration.
+        """
+        try:
+            if not self.qdrant_service:
+                logger.warning("Qdrant service not initialized, skipping data save")
+                return False
+            
+            # Insert detection data with location information
+            success = await self.qdrant_service.insert_detection_data(
+                username=owner_username,
+                camera_id_str=stream_id_str,
+                camera_name=camera_name,
+                count=person_count,
+                male_count=male_count,
+                female_count=female_count,
+                fire_status=fire_status,
+                frame=frame,
+                workspace_id=workspace_id,
+                location_info=location_info
+            )
+            
+            if success:
+                logger.debug(f"Saved detection data to Qdrant for stream {stream_id_str}: "
+                           f"count={person_count}, male={male_count}, female={female_count}, fire={fire_status}")
+            else:
+                logger.warning(f"Failed to save detection data to Qdrant for stream {stream_id_str}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error saving detection to Qdrant for stream {stream_id_str}: {e}", exc_info=True)
+            return False
+
     async def _handle_people_count_alert(
         self,
         stream_id: UUID,
@@ -401,10 +451,14 @@ class StreamProcessingService:
                     camera_name=camera_name
                 )
                 
+                user_email = await user_manager.get_user_by_id(owner_id)
+
+                user_email = user_email["email"]
                 # Send email
                 await send_fire_alert_email(
+                    user_email=user_email,
                     camera_name=camera_name,
-                    fire_type=fire_status
+                    fire_status=fire_status
                 )
                 
                 # Update fire detection state
@@ -433,9 +487,12 @@ class StreamProcessingService:
     ):
         """
         Main stream processing loop with shared video source support.
+        Now includes periodic saving to Qdrant database.
         """
         frame_count = 0
+        frames_since_last_save = 0
         last_db_update_activity = datetime.now(timezone.utc)
+        last_heartbeat = datetime.now(timezone.utc)
         stream_id_str = str(stream_id)
         loop = asyncio.get_event_loop()
         shared_stream = None
@@ -462,9 +519,12 @@ class StreamProcessingService:
             # Get stream parameters
             from app.services.parameter_service import parameter_service
             params = await parameter_service.get_workspace_params(workspace_id)
-            frame_skip = params.get("frame_skip", 300)
+            frame_skip = params.get("frame_skip", 300)  # Save to Qdrant every N frames
             frame_delay_target = params.get("frame_delay", 0.033)  # ~30 FPS default
             conf_threshold = params.get("conf", 0.5)
+            
+            logger.info(f"Stream {stream_id_str} parameters: frame_skip={frame_skip}, "
+                       f"frame_delay={frame_delay_target}, conf={conf_threshold}")
             
             # Get or create shared stream
             shared_stream = self.video_file_manager.get_shared_stream(source)
@@ -479,11 +539,25 @@ class StreamProcessingService:
             # Main processing loop
             while not stop_event.is_set():
                 try:
-                    # Wait for frame to be available
-                    if not shared_stream.wait_for_frame(timeout=5.0):
+                    current_time = datetime.now(timezone.utc)
+                    if (current_time - last_heartbeat).total_seconds() >= 10:
+                        # Update last_frame_time as heartbeat every 10 seconds
+                        if self.stream_manager:
+                            async with self.stream_manager._lock:
+                                if stream_id_str in self.stream_manager.active_streams:
+                                    self.stream_manager.active_streams[stream_id_str]['last_heartbeat'] = current_time
+                        last_heartbeat = current_time
+                    
+                    # Wait for frame with longer timeout
+                    if not shared_stream.wait_for_frame(timeout=10.0):  # CHANGED: Increased from 5.0
                         consecutive_failures += 1
+                        
+                        # Log waiting status every 30 seconds
+                        if consecutive_failures % 3 == 0:
+                            logger.debug(f"Stream {stream_id_str} waiting for frames... ({consecutive_failures} attempts)")
+                        
                         if consecutive_failures > max_consecutive_failures:
-                            logger.error(f"Too many consecutive frame failures for {stream_id_str}")
+                            logger.error(f"Too many consecutive frame wait timeouts for {stream_id_str}")
                             break
                         await asyncio.sleep(0.1)
                         continue
@@ -502,6 +576,7 @@ class StreamProcessingService:
                     # Reset failure counter on successful frame
                     consecutive_failures = 0
                     
+                    
                     # Mark as active after first successful frame
                     if not first_frame_received:
                         first_frame_received = True
@@ -509,6 +584,7 @@ class StreamProcessingService:
                         logger.info(f"First frame received for stream {stream_id_str}")
                     
                     frame_count += 1
+                    frames_since_last_save += 1
                     
                     # Process frame with detection
                     annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status = \
@@ -525,8 +601,10 @@ class StreamProcessingService:
                     if self.stream_manager:
                         async with self.stream_manager._lock:
                             if stream_id_str in self.stream_manager.active_streams:
+                                current_time_utc = datetime.now(timezone.utc)
                                 self.stream_manager.active_streams[stream_id_str]['latest_frame'] = annotated_frame
-                                self.stream_manager.active_streams[stream_id_str]['last_frame_time'] = datetime.now(timezone.utc)
+                                self.stream_manager.active_streams[stream_id_str]['last_frame_time'] = current_time_utc
+                                self.stream_manager.active_streams[stream_id_str]['last_heartbeat'] = current_time_utc
                                 self.stream_manager.active_streams[stream_id_str]['person_count'] = person_count
                                 self.stream_manager.active_streams[stream_id_str]['male_count'] = male_count
                                 self.stream_manager.active_streams[stream_id_str]['female_count'] = female_count
@@ -536,6 +614,37 @@ class StreamProcessingService:
                     if stream_id_str in self.stream_manager.stream_processing_stats:
                         self.stream_manager.stream_processing_stats[stream_id_str]['frames_processed'] += 1
                         self.stream_manager.stream_processing_stats[stream_id_str]['last_updated'] = datetime.now(timezone.utc)
+                    
+                    # === SAVE TO QDRANT PERIODICALLY ===
+                    # Save data to Qdrant every frame_skip frames (or if people detected and skip < 100)
+                    should_save_to_qdrant = False
+                    
+                    if frames_since_last_save >= frame_skip:
+                        should_save_to_qdrant = True
+                    elif person_count > 0 and frame_skip > 100 and frames_since_last_save >= 30:
+                        # For long frame_skip, still save when people detected
+                        should_save_to_qdrant = True
+                    
+                    if should_save_to_qdrant:
+                        # Save to Qdrant (use original frame, not annotated)
+                        save_success = await self._save_detection_to_qdrant(
+                            stream_id_str=stream_id_str,
+                            camera_name=camera_name,
+                            owner_username=owner_username,
+                            person_count=person_count,
+                            male_count=male_count,
+                            female_count=female_count,
+                            fire_status=fire_status,
+                            frame=frame,  # Use original frame for storage
+                            workspace_id=workspace_id,
+                            location_info=location_info
+                        )
+                        
+                        if save_success:
+                            frames_since_last_save = 0
+                            if self.stream_manager and stream_id_str in self.stream_manager.stream_processing_stats:
+                                self.stream_manager.stream_processing_stats[stream_id_str]['detection_count'] = \
+                                    self.stream_manager.stream_processing_stats[stream_id_str].get('detection_count', 0) + 1
                     
                     # Handle alerts
                     if alert_triggered and threshold_settings.get("alert_enabled"):
@@ -582,7 +691,7 @@ class StreamProcessingService:
         
         finally:
             # Cleanup
-            logger.info(f"Cleaning up stream {stream_id_str}")
+            logger.info(f"Cleaning up stream {stream_id_str}. Total frames: {frame_count}")
             
             if shared_stream:
                 shared_stream.remove_subscriber(stream_id_str)

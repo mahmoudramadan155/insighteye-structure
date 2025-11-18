@@ -16,7 +16,7 @@ from app.services.people_count_service import people_count_service
 from app.services.notification_service import notification_service
 from app.services.video_stream_service import video_stream_service
 from app.services.parameter_service import parameter_service
-# from app.services.qdrant_service import qdrant_service  
+  
 from app.services.unified_data_service import unified_data_service as qdrant_service
 from app.services.workspace_service import workspace_service
 from app.services.shared_stream_service import video_file_manager
