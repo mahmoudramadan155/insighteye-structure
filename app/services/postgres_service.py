@@ -1,15 +1,10 @@
 # app/services/postgres_service.py
-from typing import List, Dict, Any, Optional, Union, Tuple
+from typing import List, Dict, Any, Optional, Union
 from uuid import UUID, uuid4
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
 import logging
-import asyncpg
-from fastapi import HTTPException, status
-
 from app.services.database import db_manager
 from app.schemas import StreamUpdate
-from app.config.settings import config
 
 logger = logging.getLogger(__name__)
 
