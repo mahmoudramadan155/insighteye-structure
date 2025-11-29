@@ -1247,6 +1247,290 @@ class StreamManager:
             except Exception as e:
                 logging.error(f"Error in resource monitor: {e}", exc_info=True)
 
+    # async def manage_streams_with_deduplication(self):
+    #     """Stream management loop with better error handling."""
+    #     consecutive_errors = 0
+    #     max_consecutive_errors = 5
+        
+    #     while True:
+    #         try:
+    #             # CRITICAL FIX: Exclude streams in transitional states
+    #             # Don't stop streams that are 'stopping' or 'restarting'
+    #             streams_to_run_query = """
+    #                 SELECT vs.stream_id, vs.name, vs.path, vs.user_id, vs.workspace_id, 
+    #                     u.username, u.role as user_role, u.is_subscribed, u.is_active,
+    #                     w.is_active as workspace_active, w.name as workspace_name,
+    #                     vs.location, vs.area, vs.building, vs.zone, vs.floor_level,
+    #                     vs.latitude, vs.longitude, vs.is_streaming, vs.status
+    #                 FROM video_stream vs
+    #                 JOIN users u ON vs.user_id = u.user_id
+    #                 JOIN workspaces w ON vs.workspace_id = w.workspace_id
+    #                 WHERE vs.is_streaming = TRUE 
+    #                     AND u.is_active = TRUE
+    #                     AND w.is_active = TRUE
+    #                     AND (u.is_subscribed = TRUE OR u.role = 'admin')
+    #                     -- CRITICAL: Don't process transitional states
+    #                     AND vs.status NOT IN ('stopping', 'restarting')
+    #             """
+    #             potential_streams_db = await self.db_manager.execute_query(
+    #                 streams_to_run_query, fetch_all=True
+    #             )
+    #             potential_streams_db = potential_streams_db or []
+                
+    #             # Log database state
+    #             logger.debug(f"📊 Database query returned {len(potential_streams_db)} streams that should be running")
+
+    #             async with self._lock:
+    #                 current_running_ids_mem = set(self.active_streams.keys())
+                
+    #             logger.debug(f"📊 Currently running in memory: {len(current_running_ids_mem)} streams")
+
+    #             db_should_run_ids = {str(s['stream_id']) for s in potential_streams_db}
+
+    #             # CRITICAL FIX: Before stopping streams, check if they're in transitional states
+    #             streams_to_stop_ids = current_running_ids_mem - db_should_run_ids
+                
+    #             # Filter out streams that are just stopping/restarting
+    #             truly_stop_ids = set()
+    #             for stream_id_str in streams_to_stop_ids:
+    #                 async with self._lock:
+    #                     stream_info = self.active_streams.get(stream_id_str)
+    #                     if stream_info:
+    #                         status = stream_info.get('status')
+    #                         # Don't stop if already stopping or in transition
+    #                         if status not in ['stopping', 'restarting']:
+    #                             truly_stop_ids.add(stream_id_str)
+    #                         else:
+    #                             logger.debug(f"⏸️ Skipping {stream_id_str} - in transition ({status})")
+                
+    #             if truly_stop_ids:
+    #                 logger.warning(f"🛑 STOPPING {len(truly_stop_ids)} streams - Database says they shouldn't be running!")
+    #                 logger.warning(f"🛑 Streams to stop: {truly_stop_ids}")
+    #                 logger.warning(f"🛑 DB says should run: {db_should_run_ids}")
+
+    #                 # For each stream being stopped, log why
+    #                 for stream_id_str in truly_stop_ids:
+    #                     check_query = """
+    #                         SELECT vs.stream_id, vs.is_streaming, vs.status,
+    #                             u.is_active as user_active, u.is_subscribed, u.role,
+    #                             w.is_active as workspace_active
+    #                         FROM video_stream vs
+    #                         JOIN users u ON vs.user_id = u.user_id
+    #                         JOIN workspaces w ON vs.workspace_id = w.workspace_id
+    #                         WHERE vs.stream_id = $1
+    #                     """
+    #                     check_result = await self.db_manager.execute_query(
+    #                         check_query, (UUID(stream_id_str),), fetch_one=True
+    #                     )
+                        
+    #                     if check_result:
+    #                         reasons = []
+    #                         if not check_result['is_streaming']:
+    #                             reasons.append("is_streaming=FALSE")
+    #                         if not check_result['user_active']:
+    #                             reasons.append("user_inactive")
+    #                         if not check_result['is_subscribed'] and check_result['role'] != 'admin':
+    #                             reasons.append("user_not_subscribed")
+    #                         if not check_result['workspace_active']:
+    #                             reasons.append("workspace_inactive")
+    #                         if check_result['status'] in ['stopping', 'restarting']:
+    #                             reasons.append(f"status={check_result['status']}")
+                            
+    #                         logger.warning(f"🛑 Stream {stream_id_str} being stopped because: {', '.join(reasons)}")
+    #                         logger.warning(f"   Details: is_streaming={check_result['is_streaming']}, "
+    #                                     f"status={check_result['status']}, "
+    #                                     f"user_active={check_result['user_active']}, "
+    #                                     f"subscribed={check_result['is_subscribed']}, "
+    #                                     f"workspace_active={check_result['workspace_active']}")
+    #                     else:
+    #                         logger.warning(f"🛑 Stream {stream_id_str} not found in database!")
+                    
+    #                 stop_tasks = [
+    #                     self._stop_stream(stream_id_str, for_restart=False)
+    #                     for stream_id_str in truly_stop_ids
+    #                 ]
+    #                 await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+    #             # Group streams by workspace and file path
+    #             workspace_streams_map = defaultdict(lambda: defaultdict(list))
+    #             for stream_data in potential_streams_db:
+    #                 ws_id = str(stream_data['workspace_id'])
+    #                 file_path = stream_data['path']
+    #                 workspace_streams_map[ws_id][file_path].append(stream_data)
+
+    #             # Track start requests for batching
+    #             start_tasks = []
+
+    #             # Process each workspace
+    #             for workspace_id_str, paths_map in workspace_streams_map.items():
+    #                 try:
+    #                     workspace_id = UUID(workspace_id_str)
+                        
+    #                     # Check workspace limits (with caching)
+    #                     limits = await self.get_workspace_stream_limits(workspace_id)
+                        
+    #                     if limits['available_slots'] <= 0:
+    #                         logger.warning(
+    #                             f"⚠️ Workspace {workspace_id_str} at capacity "
+    #                             f"({limits['current_active']}/{limits['total_camera_limit']})"
+    #                         )
+    #                         continue
+                        
+    #                     # Process each file path in workspace
+    #                     for file_path, streams_for_path in paths_map.items():
+    #                         # Sort by priority (admin first, then by stream_id for consistency)
+    #                         streams_for_path.sort(key=lambda x: (
+    #                             x.get('user_role') != 'admin',
+    #                             x['stream_id']
+    #                         ))
+                            
+    #                         enable_sharing = config.get("enable_stream_sharing", True)
+    #                         max_streams_per_file = config.get(
+    #                             "max_streams_per_file", 
+    #                             5 if enable_sharing else 1
+    #                         )
+                            
+    #                         active_streams_for_path = [
+    #                             s for s in streams_for_path
+    #                             if str(s['stream_id']) in current_running_ids_mem
+    #                         ]
+                            
+    #                         can_start_count = max_streams_per_file - len(active_streams_for_path)
+    #                         started_count = 0
+                            
+    #                         for stream_data in streams_for_path:
+    #                             stream_id_str = str(stream_data['stream_id'])
+                                
+    #                             # Skip if already running
+    #                             if stream_id_str in current_running_ids_mem:
+    #                                 continue
+                                
+    #                             # Skip if reached file limit
+    #                             if started_count >= can_start_count:
+    #                                 logger.debug(
+    #                                     f"File {file_path} reached concurrent limit "
+    #                                     f"({max_streams_per_file})"
+    #                                 )
+    #                                 break
+                                
+    #                             # Skip if reached workspace limit
+    #                             if limits['available_slots'] <= started_count:
+    #                                 logger.debug(
+    #                                     f"Workspace {workspace_id_str} reached limit, "
+    #                                     f"deferring stream {stream_id_str}"
+    #                                 )
+    #                                 break
+                                
+    #                             # Double-check user limits
+    #                             owner_id_obj = stream_data['user_id']
+    #                             can_start, reason = await self.can_start_stream_in_workspace(
+    #                                 workspace_id, owner_id_obj
+    #                             )
+                                
+    #                             if not can_start:
+    #                                 logger.warning(
+    #                                     f"Cannot start stream {stream_id_str}: {reason}"
+    #                                 )
+    #                                 # Update database to reflect inability to start
+    #                                 await self.video_stream_service.update_stream_status(
+    #                                     stream_data['stream_id'], 'inactive', is_streaming=False
+    #                                 )
+    #                                 continue
+
+    #                             # Prepare location info
+    #                             location_info = {
+    #                                 'location': stream_data.get('location'),
+    #                                 'area': stream_data.get('area'),
+    #                                 'building': stream_data.get('building'),
+    #                                 'zone': stream_data.get('zone'),
+    #                                 'floor_level': stream_data.get('floor_level'),
+    #                                 'latitude': stream_data.get('latitude'),
+    #                                 'longitude': stream_data.get('longitude')
+    #                             }
+                                
+    #                             # Create start task
+    #                             task = self.start_stream_background(
+    #                                 stream_data['stream_id'],
+    #                                 owner_id_obj,
+    #                                 stream_data['username'],
+    #                                 stream_data['name'],
+    #                                 stream_data['path'],
+    #                                 workspace_id,
+    #                                 location_info
+    #                             )
+    #                             start_tasks.append(task)
+    #                             started_count += 1
+                    
+    #                 except Exception as e:
+    #                     logger.error(
+    #                         f"Error processing workspace {workspace_id_str}: {e}", 
+    #                         exc_info=True
+    #                     )
+    #                     consecutive_errors += 1
+
+    #             # Execute all start tasks concurrently (with limit)
+    #             if start_tasks:
+    #                 batch_size = config.get("stream_start_batch_size", 10)
+    #                 for i in range(0, len(start_tasks), batch_size):
+    #                     batch = start_tasks[i:i + batch_size]
+    #                     results = await asyncio.gather(*batch, return_exceptions=True)
+                        
+    #                     # Log any errors
+    #                     for idx, result in enumerate(results):
+    #                         if isinstance(result, Exception):
+    #                             logger.error(
+    #                                 f"Error starting stream in batch: {result}", 
+    #                                 exc_info=result
+    #                             )
+
+    #             # Stop streams that should no longer be running
+    #             streams_to_stop_ids = current_running_ids_mem - db_should_run_ids
+    #             if streams_to_stop_ids:
+    #                 logger.info(f"Stopping {len(streams_to_stop_ids)} streams")
+    #                 stop_tasks = [
+    #                     self._stop_stream(stream_id_str, for_restart=False)
+    #                     for stream_id_str in streams_to_stop_ids
+    #                 ]
+    #                 await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+    #             # Cleanup empty shared streams
+    #             self.video_file_manager.cleanup_empty_streams()
+
+    #             # Health check
+    #             current_time = datetime.now(timezone.utc)
+    #             if (current_time - self.last_healthcheck).total_seconds() > self.healthcheck_interval:
+    #                 await self._check_stream_health()
+                
+    #             # Reset error counter on success
+    #             consecutive_errors = 0
+                
+    #         except asyncio.CancelledError:
+    #             logging.info("Manage streams task cancelled")
+    #             break
+    #         except Exception as e:
+    #             logging.error(f"Error in manage_streams loop: {e}", exc_info=True)
+    #             consecutive_errors += 1
+                
+    #             # If too many consecutive errors, increase sleep time
+    #             if consecutive_errors >= max_consecutive_errors:
+    #                 logger.error(
+    #                     f"⚠️ {consecutive_errors} consecutive errors in manage_streams. "
+    #                     f"Backing off..."
+    #                 )
+    #                 await asyncio.sleep(30)  # Back off for 30 seconds
+    #                 consecutive_errors = 0  # Reset after backoff
+            
+    #         # Dynamic sleep based on load
+    #         active_count = len(self.active_streams)
+    #         if active_count > 50:
+    #             sleep_time = 12.0  # More frequent checks when busy
+    #         elif active_count > 20:
+    #             sleep_time = 13.0
+    #         else:
+    #             sleep_time = config.get("stream_manager_poll_interval_seconds", 15.0)
+            
+    #         await asyncio.sleep(sleep_time)
+
     async def manage_streams_with_deduplication(self):
         """Stream management loop with better error handling."""
         consecutive_errors = 0
@@ -1254,7 +1538,7 @@ class StreamManager:
         
         while True:
             try:
-                # CRITICAL FIX: More explicit query with proper status filter
+                # CRITICAL FIX: More robust query that includes ALL active streams
                 streams_to_run_query = """
                     SELECT vs.stream_id, vs.name, vs.path, vs.user_id, vs.workspace_id, 
                         u.username, u.role as user_role, u.is_subscribed, u.is_active,
@@ -1269,121 +1553,137 @@ class StreamManager:
                         AND u.is_active = TRUE
                         AND w.is_active = TRUE
                         AND (u.is_subscribed = TRUE OR u.role = 'admin')
-                        -- CRITICAL FIX: Explicitly include active/processing streams
-                        AND vs.status IN ('active', 'processing', 'starting')
-                        -- Exclude only intentional stops
-                        AND vs.status NOT IN ('stopping', 'inactive', 'error')
+                        -- CRITICAL: Don't process transitional states
+                        AND vs.status NOT IN ('stopping', 'restarting')
                 """
-                
                 potential_streams_db = await self.db_manager.execute_query(
                     streams_to_run_query, fetch_all=True
                 )
                 potential_streams_db = potential_streams_db or []
                 
-                logger.info(
-                    f"📊 Management loop: Database query returned {len(potential_streams_db)} streams "
-                    f"with status filter"
-                )
+                # Log database state
+                logger.info(f"📊 Management loop: Database says {len(potential_streams_db)} streams should be running")
 
-                # Rest of your management loop code...
                 async with self._lock:
                     current_running_ids_mem = set(self.active_streams.keys())
                 
-                logger.info(f"📊 Memory has {len(current_running_ids_mem)} active streams")
+                logger.info(f"📊 Management loop: Currently running in memory: {len(current_running_ids_mem)} streams")
 
                 db_should_run_ids = {str(s['stream_id']) for s in potential_streams_db}
 
-                # Streams to stop verification...
+                # CRITICAL FIX: Before stopping streams, verify they REALLY shouldn't be running
                 streams_to_stop_ids = current_running_ids_mem - db_should_run_ids
                 
                 if streams_to_stop_ids:
                     logger.warning(
-                        f"⚠️ Found {len(streams_to_stop_ids)} streams to potentially stop"
+                        f"⚠️ Management loop found {len(streams_to_stop_ids)} streams to potentially stop: "
+                        f"{streams_to_stop_ids}"
                     )
                     
                     # RE-VERIFY each stream before stopping
                     verified_to_stop = set()
                     
                     for stream_id_str in streams_to_stop_ids:
-                        # Check if stream is actively processing
+                        # Check if stream is in transitional state
                         async with self._lock:
                             stream_info = self.active_streams.get(stream_id_str)
                             if stream_info:
-                                # Check last frame time
+                                status = stream_info.get('status')
+                                # Don't stop if actively processing or just starting
+                                if status in ['stopping', 'restarting', 'starting', 'active_pending']:
+                                    logger.info(f"⏸️ Skipping {stream_id_str} - in transition ({status})")
+                                    continue
+                                
+                                # Check last frame time - if recent, don't stop
                                 last_frame = stream_info.get('last_frame_time')
                                 if last_frame:
-                                    time_since_frame = (
-                                        datetime.now(timezone.utc) - last_frame
-                                    ).total_seconds()
-                                    
-                                    # CRITICAL: Don't stop if actively processing
-                                    if time_since_frame < 60:
+                                    time_since_frame = (datetime.now(timezone.utc) - last_frame).total_seconds()
+                                    if time_since_frame < 60:  # Active within last minute
                                         logger.info(
-                                            f"⏸️ Stream {stream_id_str} active "
-                                            f"({time_since_frame:.1f}s since frame) - KEEPING ALIVE"
-                                        )
-                                        
-                                        # FORCE database to match reality
-                                        await self.db_manager.execute_query(
-                                            """UPDATE video_stream 
-                                            SET is_streaming = TRUE, 
-                                                status = 'active',
-                                                updated_at = NOW(),
-                                                last_activity = NOW()
-                                            WHERE stream_id = $1""",
-                                            (UUID(stream_id_str),)
+                                            f"⏸️ Skipping {stream_id_str} - actively processing "
+                                            f"(last frame {time_since_frame:.1f}s ago)"
                                         )
                                         continue
                         
-                        # If we get here, verify with database
+                        # Double-check database state for this specific stream
                         check_query = """
-                            SELECT vs.is_streaming, vs.status,
-                                u.is_active, u.is_subscribed, u.role,
-                                w.is_active as workspace_active
+                            SELECT vs.stream_id, vs.is_streaming, vs.status,
+                                u.is_active as user_active, u.is_subscribed, u.role,
+                                w.is_active as workspace_active,
+                                vs.updated_at, vs.last_activity
                             FROM video_stream vs
                             JOIN users u ON vs.user_id = u.user_id
                             JOIN workspaces w ON vs.workspace_id = w.workspace_id
                             WHERE vs.stream_id = $1
                         """
-                        db_state = await self.db_manager.execute_query(
+                        check_result = await self.db_manager.execute_query(
                             check_query, (UUID(stream_id_str),), fetch_one=True
                         )
                         
-                        if not db_state:
+                        if not check_result:
+                            logger.warning(f"🛑 Stream {stream_id_str} not found in database - will stop")
                             verified_to_stop.add(stream_id_str)
                             continue
                         
-                        # Only stop if truly should not be running
-                        should_stop = (
-                            not db_state['is_streaming'] or
-                            db_state['status'] in ('inactive', 'stopped') or
-                            not db_state['is_active'] or
-                            not db_state['workspace_active'] or
-                            (not db_state['is_subscribed'] and db_state['role'] != 'admin')
-                        )
+                        # Build stop reasons
+                        reasons = []
+                        should_stop = False
+                        
+                        if not check_result['is_streaming']:
+                            reasons.append("is_streaming=FALSE")
+                            should_stop = True
+                        
+                        if check_result['status'] in ['stopping', 'inactive', 'error']:
+                            reasons.append(f"status={check_result['status']}")
+                            # Only stop if status is 'inactive' - let other statuses be handled elsewhere
+                            if check_result['status'] == 'inactive':
+                                should_stop = True
+                        
+                        if not check_result['user_active']:
+                            reasons.append("user_inactive")
+                            should_stop = True
+                        
+                        if not check_result['is_subscribed'] and check_result['role'] != 'admin':
+                            reasons.append("user_not_subscribed")
+                            should_stop = True
+                        
+                        if not check_result['workspace_active']:
+                            reasons.append("workspace_inactive")
+                            should_stop = True
+                        
+                        # Check if recently updated (within last 2 minutes) - might be actively processing
+                        if check_result.get('last_activity'):
+                            time_since_activity = (
+                                datetime.now(timezone.utc) - check_result['last_activity']
+                            ).total_seconds()
+                            if time_since_activity < 120:
+                                logger.info(
+                                    f"⏸️ Skipping {stream_id_str} - recent activity "
+                                    f"({time_since_activity:.1f}s ago)"
+                                )
+                                should_stop = False
                         
                         if should_stop:
-                            logger.warning(f"🛑 VERIFIED STOP: {stream_id_str}")
+                            logger.warning(
+                                f"🛑 VERIFIED: Stream {stream_id_str} should be stopped. "
+                                f"Reasons: {', '.join(reasons)}"
+                            )
                             verified_to_stop.add(stream_id_str)
                         else:
-                            logger.info(f"✅ Stream {stream_id_str} verified OK - correcting DB")
-                            # Correct database state
-                            await self.db_manager.execute_query(
-                                """UPDATE video_stream 
-                                SET is_streaming = TRUE, 
-                                    status = 'active',
-                                    updated_at = NOW()
-                                WHERE stream_id = $1""",
-                                (UUID(stream_id_str),)
+                            logger.info(
+                                f"✅ Stream {stream_id_str} verified OK - will continue running"
                             )
                     
                     # Only stop verified streams
                     if verified_to_stop:
-                        logger.warning(f"🛑 Stopping {len(verified_to_stop)} verified streams")
-                        for sid in verified_to_stop:
-                            await self._stop_stream(sid, for_restart=False)
+                        logger.warning(f"🛑 STOPPING {len(verified_to_stop)} verified streams")
+                        stop_tasks = [
+                            self._stop_stream(stream_id_str, for_restart=False)
+                            for stream_id_str in verified_to_stop
+                        ]
+                        await asyncio.gather(*stop_tasks, return_exceptions=True)
                     else:
-                        logger.info("✅ No streams need stopping after verification")
+                        logger.info("✅ No streams need to be stopped")
 
                 # Group streams by workspace and file path
                 workspace_streams_map = defaultdict(lambda: defaultdict(list))
@@ -1546,14 +1846,11 @@ class StreamManager:
             
             # CRITICAL FIX: Longer sleep interval to prevent interference with active streams
             # The management loop was running too frequently and stopping streams unnecessarily
+            sleep_time = config.get("stream_manager_poll_interval_seconds", 30.0)  # Increased from 15s
             
-            # Use a minimum of 30 seconds regardless of config
-            configured_sleep = config.get("stream_manager_poll_interval_seconds", 30.0)
-            sleep_time = max(30.0, configured_sleep)  # Never less than 30 seconds
-            
-            logger.info(f"💤 Management loop sleeping for {sleep_time}s")
+            logger.debug(f"💤 Management loop sleeping for {sleep_time}s")
             await asyncio.sleep(sleep_time)
-            
+
     async def _periodic_cleanup(self):
         """Periodic cleanup with better error handling."""
         while True:

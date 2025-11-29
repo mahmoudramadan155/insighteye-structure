@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 from datetime import datetime, timedelta
 from fastapi import HTTPException
-
+import traceback
+import inspect
 from app.services.database import db_manager
 
 logger = logging.getLogger(__name__)
@@ -194,40 +195,42 @@ class VideoStreamService:
             raise HTTPException(status_code=500, detail="Database error")
 
     async def update_stream_status(
-        self, 
-        stream_id: UUID, 
-        status: str, 
+        self,
+        stream_id: UUID,
+        status: str,
         is_streaming: Optional[bool] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Update video stream status."""
-        if is_streaming is not None:
-            query = """
-                UPDATE video_stream 
-                SET status = $2, is_streaming = $3, last_activity = CURRENT_TIMESTAMP
-                WHERE stream_id = $1
-                RETURNING *
-            """
-            params = (stream_id, status, is_streaming)
-        else:
-            query = """
-                UPDATE video_stream 
-                SET status = $2, last_activity = CURRENT_TIMESTAMP
-                WHERE stream_id = $1
-                RETURNING *
-            """
-            params = (stream_id, status)
-
+    ) -> bool:
+        """
+        Update stream status in database.
+        
+        CRITICAL: is_streaming should ONLY be set to False when explicitly requested,
+        NOT automatically when status becomes 'error'.
+        """
         try:
-            result = await self.db_manager.execute_query(query, params, fetch_one=True)
-            if not result:
-                raise HTTPException(status_code=404, detail="Video stream not found")
+            if is_streaming is not None:
+                # Explicit is_streaming value provided
+                query = """
+                    UPDATE video_stream 
+                    SET status = $1, is_streaming = $2, updated_at = NOW(), last_activity = NOW()
+                    WHERE stream_id = $3
+                """
+                await self.db_manager.execute_query(query, (status, is_streaming, stream_id))
+                logger.info(f"Updated stream {stream_id}: status={status}, is_streaming={is_streaming}")
+            else:
+                # Only update status, leave is_streaming unchanged
+                query = """
+                    UPDATE video_stream 
+                    SET status = $1, updated_at = NOW(), last_activity = NOW()
+                    WHERE stream_id = $2
+                """
+                await self.db_manager.execute_query(query, (status, stream_id))
+                logger.info(f"Updated stream {stream_id}: status={status} (is_streaming unchanged)")
             
-            return result
-            
-        except asyncpg.PostgresError as e:
-            logger.error(f"Database error updating stream status: {e}")
-            raise HTTPException(status_code=500, detail="Database error")
-
+            return True
+        except Exception as e:
+            logger.error(f"Error updating stream status: {e}", exc_info=True)
+            return False
+        
     async def update_stream_alert_config(
         self,
         stream_id: UUID,

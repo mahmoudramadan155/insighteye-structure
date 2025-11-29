@@ -187,7 +187,7 @@ class UnifiedDataService:
     """
     
     def __init__(self):
-        self.backend_type = config.get("data_backend", "elasticsearch").lower()
+        self.backend_type = config.get("data_backend", "qdrant").lower()
         
         if self.backend_type == "elasticsearch":
             self.backend = ElasticsearchBackend()

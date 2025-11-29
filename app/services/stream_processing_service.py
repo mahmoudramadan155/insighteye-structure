@@ -20,6 +20,7 @@ from app.utils import send_people_count_alert_email, send_fire_alert_email
 from app.services.database import db_manager
 from app.services.user_service import user_manager
 
+
 logger = logging.getLogger(__name__)
 
 # ThreadPoolExecutor for CPU-bound tasks
@@ -319,6 +320,48 @@ class StreamProcessingService:
             logger.error(f"Error saving detection to Qdrant for stream {stream_id_str}: {e}", exc_info=True)
             return False
 
+    async def verify_qdrant_save(
+        self,
+        workspace_id: UUID,
+        stream_id_str: str,
+        max_wait: float = 5.0
+    ) -> bool:
+        """
+        Verify that data was actually saved to Qdrant.
+        Returns True if data found, False otherwise.
+        """
+        try:
+            if not self.qdrant_service:
+                return False
+            
+            start_time = time.time()
+            
+            # Try to query recent data for this stream
+            while time.time() - start_time < max_wait:
+                try:
+                    # Query Qdrant for recent detections
+                    results = await self.qdrant_service.query_detections(
+                        workspace_id=workspace_id,
+                        camera_id=stream_id_str,
+                        limit=1
+                    )
+                    
+                    if results and len(results) > 0:
+                        logger.info(f"✅ Verified Qdrant save for stream {stream_id_str}")
+                        return True
+                    
+                except Exception as e:
+                    logger.debug(f"Query failed during verification: {e}")
+                
+                await asyncio.sleep(0.5)
+            
+            logger.warning(f"⚠️ Could not verify Qdrant save for stream {stream_id_str}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error verifying Qdrant save: {e}")
+            return False
+
     async def _handle_people_count_alert(
         self,
         stream_id: UUID,
@@ -485,10 +528,7 @@ class StreamProcessingService:
         stop_event: asyncio.Event,
         location_info: Optional[Dict[str, Any]] = None
     ):
-        """
-        Main stream processing loop with shared video source support.
-        Now includes periodic saving to Qdrant database.
-        """
+        """Main stream processing loop."""
         frame_count = 0
         frames_since_last_save = 0
         last_db_update_activity = datetime.now(timezone.utc)
@@ -502,9 +542,13 @@ class StreamProcessingService:
         
         # Initialize fire detection state
         if self.stream_manager:
-            self.stream_manager.fire_detection_states[stream_id_str] = "no detection"
+            self.stream_manager.fire_detection_states[stream_id_str] = {
+                'status': 'no detection',
+                'last_detection_time': None,
+                'last_notification_time': None
+            }
             self.stream_manager.fire_detection_frame_counts[stream_id_str] = 0
-        
+            
         logger.info(f"Starting stream processing for {stream_id_str} ({camera_name})")
         
         try:
@@ -512,19 +556,23 @@ class StreamProcessingService:
             threshold_settings = await self._get_camera_threshold_settings(stream_id)
             
             # Validate source
-            if not await self._validate_stream_source(source):
-                logger.error(f"Invalid or inaccessible video source: {source}")
-                raise RuntimeError(f"Invalid or inaccessible video source: {source}")
-            
+            if not source.startswith('rtsp://'):
+                if not await self._validate_stream_source(source):
+                    logger.error(f"Invalid or inaccessible video source: {source}")
+                    # DON'T update database here - let caller handle it
+                    raise RuntimeError(f"Invalid or inaccessible video source: {source}")
+            else:
+                logger.info(f"Skipping pre-validation for RTSP stream {stream_id_str}")
+
             # Get stream parameters
             from app.services.parameter_service import parameter_service
             params = await parameter_service.get_workspace_params(workspace_id)
-            frame_skip = params.get("frame_skip", 300)  # Save to Qdrant every N frames
-            frame_delay_target = params.get("frame_delay", 0.033)  # ~30 FPS default
+            frame_skip = params.get("frame_skip", 300)
+            frame_delay_target = params.get("frame_delay", 0.033)
             conf_threshold = params.get("conf", 0.5)
             
             logger.info(f"Stream {stream_id_str} parameters: frame_skip={frame_skip}, "
-                       f"frame_delay={frame_delay_target}, conf={conf_threshold}")
+                    f"frame_delay={frame_delay_target}, conf={conf_threshold}")
             
             # Get or create shared stream
             shared_stream = self.video_file_manager.get_shared_stream(source)
@@ -532,6 +580,7 @@ class StreamProcessingService:
             # Add this stream as a subscriber
             if not shared_stream.add_subscriber(stream_id_str):
                 logger.error(f"Failed to add subscriber {stream_id_str} to shared stream")
+                # DON'T update database here - let caller handle it
                 raise RuntimeError(f"Failed to subscribe to shared stream for {source}")
             
             logger.info(f"Stream {stream_id_str} subscribed to shared stream for {source}")
@@ -541,43 +590,43 @@ class StreamProcessingService:
                 try:
                     current_time = datetime.now(timezone.utc)
                     if (current_time - last_heartbeat).total_seconds() >= 10:
-                        # Update last_frame_time as heartbeat every 10 seconds
                         if self.stream_manager:
                             async with self.stream_manager._lock:
                                 if stream_id_str in self.stream_manager.active_streams:
                                     self.stream_manager.active_streams[stream_id_str]['last_heartbeat'] = current_time
                         last_heartbeat = current_time
                     
-                    # Wait for frame with longer timeout
-                    if not shared_stream.wait_for_frame(timeout=10.0):  # CHANGED: Increased from 5.0
+                    # Wait for frame
+                    if not shared_stream.wait_for_frame(timeout=10.0):
                         consecutive_failures += 1
                         
-                        # Log waiting status every 30 seconds
                         if consecutive_failures % 3 == 0:
                             logger.debug(f"Stream {stream_id_str} waiting for frames... ({consecutive_failures} attempts)")
                         
                         if consecutive_failures > max_consecutive_failures:
                             logger.error(f"Too many consecutive frame wait timeouts for {stream_id_str}")
+                            # DON'T set status='error' with is_streaming=False
+                            # Just break and let finally block handle cleanup
                             break
                         await asyncio.sleep(0.1)
                         continue
                     
-                    # Get frame from shared stream
+                    # Get frame
                     frame = shared_stream.get_latest_frame(stream_id_str)
                     
                     if frame is None or frame.size == 0:
                         consecutive_failures += 1
                         if consecutive_failures > max_consecutive_failures:
                             logger.error(f"Too many consecutive empty frames for {stream_id_str}")
+                            # DON'T set status='error' with is_streaming=False
                             break
                         await asyncio.sleep(0.1)
                         continue
                     
-                    # Reset failure counter on successful frame
+                    # Reset failure counter
                     consecutive_failures = 0
                     
-                    
-                    # Mark as active after first successful frame
+                    # Mark as active after first frame
                     if not first_frame_received:
                         first_frame_received = True
                         await self.update_stream_to_active(stream_id_str)
@@ -586,7 +635,7 @@ class StreamProcessingService:
                     frame_count += 1
                     frames_since_last_save += 1
                     
-                    # Process frame with detection
+                    # Process frame
                     annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status = \
                         await loop.run_in_executor(
                             thread_pool,
@@ -597,11 +646,11 @@ class StreamProcessingService:
                             stream_id_str
                         )
                     
-                    # Update stream manager with processed frame
+                    # Update stream manager
                     if self.stream_manager:
+                        current_time_utc = datetime.now(timezone.utc)
                         async with self.stream_manager._lock:
                             if stream_id_str in self.stream_manager.active_streams:
-                                current_time_utc = datetime.now(timezone.utc)
                                 self.stream_manager.active_streams[stream_id_str]['latest_frame'] = annotated_frame
                                 self.stream_manager.active_streams[stream_id_str]['last_frame_time'] = current_time_utc
                                 self.stream_manager.active_streams[stream_id_str]['last_heartbeat'] = current_time_utc
@@ -609,24 +658,26 @@ class StreamProcessingService:
                                 self.stream_manager.active_streams[stream_id_str]['male_count'] = male_count
                                 self.stream_manager.active_streams[stream_id_str]['female_count'] = female_count
                                 self.stream_manager.active_streams[stream_id_str]['fire_status'] = fire_status
+
+                        if stream_id_str in self.stream_manager.fire_detection_states:
+                            fire_state = self.stream_manager.fire_detection_states[stream_id_str]
+                            fire_state['status'] = fire_status
+                            if fire_status != 'no detection':
+                                fire_state['last_detection_time'] = current_time_utc
                     
-                    # Update processing stats
+                    # Update stats
                     if stream_id_str in self.stream_manager.stream_processing_stats:
                         self.stream_manager.stream_processing_stats[stream_id_str]['frames_processed'] += 1
                         self.stream_manager.stream_processing_stats[stream_id_str]['last_updated'] = datetime.now(timezone.utc)
                     
-                    # === SAVE TO QDRANT PERIODICALLY ===
-                    # Save data to Qdrant every frame_skip frames (or if people detected and skip < 100)
+                    # Save to Qdrant
                     should_save_to_qdrant = False
-                    
                     if frames_since_last_save >= frame_skip:
                         should_save_to_qdrant = True
                     elif person_count > 0 and frame_skip > 100 and frames_since_last_save >= 30:
-                        # For long frame_skip, still save when people detected
                         should_save_to_qdrant = True
                     
                     if should_save_to_qdrant:
-                        # Save to Qdrant (use original frame, not annotated)
                         save_success = await self._save_detection_to_qdrant(
                             stream_id_str=stream_id_str,
                             camera_name=camera_name,
@@ -635,7 +686,7 @@ class StreamProcessingService:
                             male_count=male_count,
                             female_count=female_count,
                             fire_status=fire_status,
-                            frame=frame,  # Use original frame for storage
+                            frame=frame,
                             workspace_id=workspace_id,
                             location_info=location_info
                         )
@@ -659,14 +710,20 @@ class StreamProcessingService:
                             camera_name, workspace_id, owner_id
                         )
                     
-                    # Periodic database updates
+                    # Periodic database updates - CRITICAL: Keep is_streaming=True
                     current_time = datetime.now(timezone.utc)
                     if (current_time - last_db_update_activity).total_seconds() >= 30:
                         from app.services.video_stream_service import video_stream_service
-                        await video_stream_service.update_stream_status(
-                            stream_id, "active", is_streaming=True
-                        )
-                        last_db_update_activity = current_time
+                        
+                        logger.debug(f"📊 Periodic update: {stream_id_str} -> status=active, is_streaming=TRUE")
+                        try:
+                            await video_stream_service.update_stream_status(
+                                stream_id, "active", is_streaming=True  # Always explicit True
+                            )
+                            last_db_update_activity = current_time
+                        except Exception as e:
+                            logger.error(f"Error in periodic DB update for {stream_id_str}: {e}")
+                            # DON'T break - continue processing even if DB update fails
                     
                     # Frame delay
                     if frame_delay_target > 0:
@@ -687,6 +744,8 @@ class StreamProcessingService:
             
         except Exception as e:
             logger.error(f"Fatal error in stream processing for {stream_id_str}: {e}", exc_info=True)
+            # CRITICAL: DON'T update database to error state here
+            # Let the caller (start_stream_background) handle errors
             raise
         
         finally:
@@ -702,17 +761,32 @@ class StreamProcessingService:
             if cache_key in self._cached_results:
                 del self._cached_results[cache_key]
             
-            # Clear fire detection state
-            if self.stream_manager:
-                self.stream_manager.fire_detection_states.pop(stream_id_str, None)
-                self.stream_manager.fire_detection_frame_counts.pop(stream_id_str, None)
+            # Keep fire detection state briefly
+            if self.stream_manager and stream_id_str in self.stream_manager.fire_detection_states:
+                self.stream_manager.fire_detection_states[stream_id_str]['status'] = 'no detection'
+                self.stream_manager.fire_detection_states[stream_id_str]['last_detection_time'] = datetime.now(timezone.utc)
             
-            # Update database
+            # CRITICAL: Only update database to inactive if stop_event was set
+            # Don't update on errors - let the management loop handle it
             try:
                 from app.services.video_stream_service import video_stream_service
-                await video_stream_service.update_stream_status(
-                    stream_id, "inactive", is_streaming=False
-                )
+                if stop_event.is_set():
+                    # User requested stop
+                    await video_stream_service.update_stream_status(
+                        stream_id, "inactive", is_streaming=False
+                    )
+                    logger.info(f"Stream {stream_id_str} stopped by user request")
+                else:
+                    # Stream ended unexpectedly - mark as error but keep is_streaming=True
+                    # This allows the management loop to restart it
+                    await video_stream_service.update_stream_status(
+                        stream_id, "error", is_streaming=True  # ← FIXED: Keep True!
+                    )
+                    logger.warning(
+                        f"⚠️ Stream {stream_id_str} ended unexpectedly. "
+                        f"Marked as error but keeping is_streaming=True for auto-restart."
+                    )
+                    
             except Exception as e:
                 logger.error(f"Error updating final stream status: {e}")
             
@@ -758,14 +832,22 @@ class StreamProcessingService:
                     self.stream_manager.active_streams[stream_id_str]['last_frame_time'] = datetime.now(timezone.utc)
                     logger.info(f"Stream {stream_id_str} status updated to 'active'")
                     
-                    # Update database status
+                    # Update database status - KEEP is_streaming=True
                     try:
                         from app.services.video_stream_service import video_stream_service
-                        await video_stream_service.update_stream_status(
+                        
+                        # CRITICAL: Always explicitly set is_streaming=True
+                        success = await video_stream_service.update_stream_status(
                             UUID(stream_id_str), 'active', is_streaming=True
                         )
+                        
+                        if not success:
+                            logger.error(f"Failed to update DB status for {stream_id_str}")
+                            # DON'T set is_streaming=False on error!
+                            # Just log and continue processing
+                            
                     except Exception as e:
-                        logger.error(f"Error updating DB status for {stream_id_str}: {e}")
+                        logger.error(f"Exception updating DB status for {stream_id_str}: {e}")
 
     def cleanup(self):
         """Cleanup resources."""

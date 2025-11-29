@@ -78,6 +78,7 @@ async def create_stream(
 
 @router.get("/source/user")
 async def get_user_streams(
+    return_base64: bool = Query(True, description="Return static_base64 field (yes/no)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get cameras for the current user in their active workspace."""
@@ -97,7 +98,7 @@ async def get_user_streams(
         )
         user_role = membership_details.get("role")
 
-        return await camera_service.get_user_cameras(user_id_obj, workspace_id_obj, user_role, encoded_string)
+        return await camera_service.get_user_cameras(user_id_obj, workspace_id_obj, user_role, encoded_string, return_base64)
         
     except HTTPException:
         raise
@@ -109,6 +110,7 @@ async def get_user_streams(
 @router.get("/source/users")
 async def get_all_streams(
     workspace_id_str: Optional[str] = Query(None, alias="workspaceId", description="ID of the workspace"),
+    return_base64: bool = Query(True, description="Return static_base64 field (yes/no)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get all streams (admin only, optionally scoped to workspace)."""
@@ -173,7 +175,7 @@ async def get_all_streams(
                 "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
                 "workspace_id": str(s["workspace_id"]) if s["workspace_id"] else None,
                 "workspace_name": s["workspace_name"],
-                "static_base64": encoded_string
+                "static_base64": encoded_string if return_base64 else ""
             } for s in streams_data
         ] if streams_data else []
         

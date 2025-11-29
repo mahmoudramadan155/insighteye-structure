@@ -1602,7 +1602,7 @@ class StreamManager:
                         logging.warning(f"Frame timeout for stream {stream_id_str} - no frames for {frame_timeout}s")
                         if hasattr(self, 'video_file_manager'):
                             await self.force_restart_shared_stream(source)
-                        await asyncio.sleep(5.0)
+                        await asyncio.sleep(15.0)
                         last_frame_received = time.time()
                         continue
                     

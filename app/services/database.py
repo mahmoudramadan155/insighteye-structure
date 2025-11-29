@@ -78,14 +78,21 @@ async def init_db_pool(min_connections=config['database'].get('min_pool_connecti
 async def setup_asyncpg_connection_types(conn: asyncpg.Connection):
     """
     Set up type codecs for an asyncpg connection.
-    Relies on asyncpg's built-in support for UUID and other common types.
+    Configure UUID to use standard Python uuid.UUID instead of asyncpg's custom UUID.
     """
-    logger.info(
-        f"For asyncpg connection {conn}: Relying on default built-in codecs for UUID. "
-        "Python uuid.UUID objects will be automatically handled for PostgreSQL UUID columns."
+    import uuid
+    
+    # Override the default UUID codec to return standard Python UUIDs
+    await conn.set_type_codec(
+        'uuid',
+        encoder=str,  # Convert UUID to string for PostgreSQL
+        decoder=uuid.UUID,  # Convert PostgreSQL UUID to Python uuid.UUID
+        schema='pg_catalog'
     )
-    logger.debug(f"Asyncpg connection {conn} type codecs setup complete (relying on defaults for common types).")
+    
+    logger.info(f"Configured asyncpg connection {conn} to use standard Python UUID objects")
 
+    
 async def close_db_pool():
     """Close the asyncpg database connection pool."""
     global connection_pool

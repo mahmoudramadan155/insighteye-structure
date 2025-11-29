@@ -20,7 +20,14 @@ RUN apt-get update && apt-get install -y \
     libavcodec-dev \
     libavformat-dev \
     libswscale-dev \
+    libavutil-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Set environment variables for FFmpeg
+ENV OPENCV_FFMPEG_THREAD_COUNT=1
+ENV OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp|timeout;10000000|stimeout;10000000|max_delay;500000"
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
 
 # Install Python dependencies
 COPY requirements.txt .

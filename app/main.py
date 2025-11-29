@@ -6,6 +6,7 @@ import logging
 import signal
 import uvicorn
 from app.config.settings import config
+from app.utils.logging_config import setup_logging
 
 from app.api.routes import router
 from app.services.stream_service_3 import stream_manager, initialize_stream_manager
@@ -18,14 +19,9 @@ from app.services.database import (
     check_postgres_health
 )
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(config.get("log_file_path", "app.log")),
-        logging.StreamHandler()
-    ])
+setup_logging(config.get("log_file_path", "/app/logs/app.log"))
 logger = logging.getLogger(__name__)
+logger.info("Logging initialized successfully!")
 
 
 @asynccontextmanager
@@ -127,42 +123,38 @@ async def add_security_headers(request: Request, call_next): # Identical to main
         del response.headers["server"]
     return response
 
-app.include_router(router)
-
-def signal_handler(signum, frame):
-    logger.info(f"Signal {signal.Signals(signum).name} received. Initiating graceful shutdown via Uvicorn.")
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-@app.get("/health", tags=["System"])
+@app.get("/health", tags=["System"])#, include_in_schema=False
 async def health_check():
     """API health check endpoint with detailed diagnostics"""
     db_healthy = False
     conn_info = "DB pool not initialized"
     pool_stats = {}
 
-    connection_pool = get_pool()
+    try:
+        connection_pool = get_pool()
 
-    if connection_pool:
-        if connection_pool._closed:
-            conn_info = "DB pool is closed"
+        if connection_pool:
+            if connection_pool._closed:
+                conn_info = "DB pool is closed"
+            else:
+                try:
+                    async with connection_pool.acquire() as conn:
+                        await conn.fetchval("SELECT 1")
+                    db_healthy = True
+                    pool_stats = {
+                        "size": connection_pool.get_size(),
+                        "idle": connection_pool.get_idle_size(),
+                        "max": connection_pool.get_max_size(),
+                    }
+                    conn_info = f"DB pool healthy (size: {pool_stats['size']}, idle: {pool_stats['idle']}/{pool_stats['max']})"
+                except Exception as e:
+                    conn_info = f"DB pool error: {str(e)}"
+                    logger.warning(f"Health check: DB connection failed - {e}", exc_info=True)
         else:
-            try:
-                async with connection_pool.acquire() as conn:
-                    await conn.fetchval("SELECT 1")
-                db_healthy = True
-                pool_stats = {
-                    "size": connection_pool.get_size(),
-                    "idle": connection_pool.get_idle_size(),
-                    "max": connection_pool.get_max_size(),
-                }
-                conn_info = f"DB pool healthy (size: {pool_stats['size']}, idle: {pool_stats['idle']}/{pool_stats['max']})"
-            except Exception as e:
-                conn_info = f"DB pool error: {str(e)}"
-                logger.warning(f"Health check: DB connection failed - {e}", exc_info=True)
-    else:
-        conn_info = "DB pool is None"
+            conn_info = "DB pool is None"
+    except Exception as e:
+        conn_info = f"Unexpected error: {str(e)}"
+        logger.error(f"Health check error: {e}", exc_info=True)
 
     return {
         "status": "healthy" if db_healthy else "degraded",
@@ -172,12 +164,29 @@ async def health_check():
         "pool_stats": pool_stats if pool_stats else None,
     }
 
+app.include_router(router)
+
+def signal_handler(signum, frame):
+    logger.info(f"Signal {signal.Signals(signum).name} received. Initiating graceful shutdown via Uvicorn.")
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
 @app.on_event("startup")
 async def on_startup():
     try:
         await init_db_pool()  # Ensures retry until DB is ready
     except Exception as e:
         logger.error(f"Startup DB connection failed ❌: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Application shutdown"""
+    
+    logging.info("Shutting down application...")
+    await stream_manager.shutdown()
+    logging.info("✅ Application shutdown complete")
 
 if __name__ == "__main__":
     server_host = config.get("server_host", "0.0.0.0")

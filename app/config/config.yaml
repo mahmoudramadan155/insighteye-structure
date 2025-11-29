@@ -81,7 +81,7 @@ otp_sender_email: "mimo16603@gmail.com"
 insert_batch_size: 5
 insert_interval: 60 #seconds
 
-DATA_BACKEND: elasticsearch
+DATA_BACKEND: "qdrant"
 
 qdrant_url: "172.31.25.133"
 qdrant_port: 6333
@@ -91,7 +91,7 @@ qdrant_fetch_limit: 50
 qdrant_vector_size: 1
 
 elasticsearch_hosts: "http://172.31.25.133:9200"
-elasticsearch_index_name: person_counts
+elasticsearch_index_name: "person_counts"
 elasticsearch_timeout: 60.0
 elasticsearch_version: 8
 
@@ -215,5 +215,5 @@ SHARED_STREAM_FRAME_WAIT_TIMEOUT: 15.0
 RTSP_CONNECTION_TIMEOUT: 30  # seconds
 RTSP_READ_TIMEOUT: 30  # seconds
 RTSP_RECONNECT_ATTEMPTS: 10  # More attempts for network streams
-RTSP_TRANSPORT: tcp  # "tcp" or "udp" - TCP is more reliable
+RTSP_TRANSPORT: "tcp"  # "tcp" or "udp" - TCP is more reliable
 RTSP_BUFFER_SIZE: 1  # Keep small for low latency

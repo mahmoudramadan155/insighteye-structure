@@ -102,7 +102,8 @@ class CameraService:
         user_id: UUID, 
         workspace_id: UUID,
         user_role: str,
-        encoded_string: str
+        encoded_string: str,
+        return_base64: bool
     ) -> List[Dict]:
         """Get cameras for a user in their workspace."""
         try:
@@ -150,7 +151,7 @@ class CameraService:
                     "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
                     "workspace_id": str(workspace_id), 
                     "workspace_name": s["workspace_name"],
-                    "static_base64": encoded_string 
+                    "static_base64": encoded_string if return_base64 else ""
                 } for s in streams_data
             ] if streams_data else []
             

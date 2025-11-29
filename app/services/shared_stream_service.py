@@ -7,10 +7,14 @@ import asyncio
 import cv2
 import numpy as np
 import threading 
+import os
 from typing import Dict, Optional, Any
 
 class SharedVideoStream:
-    """Shared video stream to avoid multiple file handles for the same source"""
+    """
+    Thread-safe shared video stream with single-threaded reading.
+    CRITICAL: Only ONE thread reads from cv2.VideoCapture to avoid FFmpeg async_lock errors.
+    """
     
     def __init__(self, source: str, max_subscribers: int = 10):
         self.source = source
@@ -18,28 +22,42 @@ class SharedVideoStream:
         self.cap: Optional[cv2.VideoCapture] = None
         self.latest_frame: Optional[np.ndarray] = None
         self.is_running = False
+        
+        # CRITICAL: Use RLock to prevent deadlocks, but ensure single-threaded reading
         self.lock = threading.RLock()
         self.frame_available = threading.Event()
         self.max_subscribers = max_subscribers
         self.capture_thread: Optional[threading.Thread] = None
         self.stop_capture = threading.Event()
-        self.frame_queue = queue.Queue(maxsize=3)
+        
+        # REMOVED: frame_queue - causes threading issues
+        # self.frame_queue = queue.Queue(maxsize=3)
+        
         self.last_frame_time = time.time()
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         
-        # Enhanced error tracking
+        # Error tracking
         self.frame_count = 0
         self.last_error = None
         self.error_count = 0
         self.consecutive_failures = 0
         self.last_successful_read = time.time()
         
-        # File validation
+        # Source type detection
         self.is_file_source = self._is_file_source(source)
+        self.is_rtsp_source = self._is_rtsp_source(source)
         self.file_exists = self._validate_file_source(source) if self.is_file_source else True
         
-        logging.info(f"Created SharedVideoStream for source: {source} (file: {self.is_file_source}, exists: {self.file_exists})")
+        # RTSP settings
+        self.rtsp_timeout = 10
+        self.rtsp_reconnect_delay = 1
+        
+        # CRITICAL: Capture lock to ensure only one read() at a time
+        self._capture_lock = threading.Lock()
+        
+        logging.info(f"Created SharedVideoStream for source: {source} "
+                    f"(file: {self.is_file_source}, rtsp: {self.is_rtsp_source})")
     
     def add_subscriber(self, stream_id: str, callback_info: Dict[str, Any] = None) -> bool:
         """Add a subscriber to this shared stream"""
@@ -55,9 +73,9 @@ class SharedVideoStream:
                 'callback_info': callback_info or {}
             }
             
-            logging.info(f"Added subscriber {stream_id} to {self.source}. Total subscribers: {len(self.subscribers)}")
+            logging.info(f"Added subscriber {stream_id} to {self.source}. Total: {len(self.subscribers)}")
             
-            # Start capture if this is the first subscriber
+            # Start capture if first subscriber
             if len(self.subscribers) == 1 and not self.is_running:
                 self._start_capture()
             
@@ -69,9 +87,9 @@ class SharedVideoStream:
             if stream_id in self.subscribers:
                 subscriber_info = self.subscribers.pop(stream_id)
                 logging.info(f"Removed subscriber {stream_id} from {self.source}. "
-                           f"Frames received: {subscriber_info.get('frames_received', 0)}")
+                           f"Frames: {subscriber_info.get('frames_received', 0)}")
             
-            # Stop capture if no more subscribers
+            # Stop capture if no subscribers
             if not self.subscribers and self.is_running:
                 self._stop_capture()
     
@@ -84,6 +102,7 @@ class SharedVideoStream:
             if self.latest_frame is not None:
                 self.subscribers[stream_id]['frames_received'] += 1
                 self.subscribers[stream_id]['last_frame_time'] = time.time()
+                # Return a copy to avoid race conditions
                 return self.latest_frame.copy()
             
             return None
@@ -102,30 +121,58 @@ class SharedVideoStream:
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
         logging.info(f"Started capture thread for {self.source}")
+
+    def _is_file_source(self, source: str) -> bool:
+        """Check if source is a file path"""
+        return (not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and 
+                not source.isdigit())
     
-    def _stop_capture(self):
-        """Stop the video capture thread"""
-        if not self.is_running:
-            return
+    def _is_rtsp_source(self, source: str) -> bool:
+        """Check if source is an RTSP stream"""
+        return source.startswith('rtsp://')
+    
+    def _validate_file_source(self, source: str) -> bool:
+        """Validate that file source exists"""
+        try:
+            if not os.path.exists(source):
+                logging.error(f"Video file does not exist: {source}")
+                return False
             
-        logging.info(f"Stopping capture for {self.source}")
-        self.is_running = False
-        self.stop_capture.set()
+            if not os.access(source, os.R_OK):
+                logging.error(f"Video file is not readable: {source}")
+                return False
+            
+            file_size = os.path.getsize(source)
+            if file_size == 0:
+                logging.error(f"Video file is empty: {source}")
+                return False
+            
+            logging.info(f"Video file validated: {source} ({file_size} bytes)")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error validating video file {source}: {e}")
+            return False
+
+    def _configure_rtsp_environment(self):
+        """Configure environment for RTSP"""
+        if not self.is_rtsp_source:
+            return
         
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=5.0)
-            if self.capture_thread.is_alive():
-                logging.warning(f"Capture thread for {self.source} did not stop within timeout")
+        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
+            f'rtsp_transport;tcp|'
+            f'timeout;{self.rtsp_timeout * 1000000}|'
+            f'stimeout;{self.rtsp_timeout * 1000000}|'
+            f'max_delay;500000'
+        )
         
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        # CRITICAL: Disable threading in FFmpeg to avoid async_lock issues
+        os.environ['OPENCV_FFMPEG_THREAD_COUNT'] = '1'
         
-        self.capture_thread = None
-        logging.info(f"Stopped capture for {self.source}")
+        logging.info(f"Configured RTSP environment for {self.source}")
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get statistics for this shared stream"""
+        """Get statistics"""
         with self.lock:
             return {
                 'source': self.source,
@@ -145,282 +192,452 @@ class SharedVideoStream:
                 }
             }
 
-    def _is_file_source(self, source: str) -> bool:
-        """Check if source is a file path vs stream URL"""
-        return (not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and 
-                not source.isdigit())  # Not a camera index
-    
-    def _validate_file_source(self, source: str) -> bool:
-        """Validate that file source exists and is readable"""
-        try:
-            import os
-            if not os.path.exists(source):
-                logging.error(f"Video file does not exist: {source}")
-                return False
-            
-            if not os.access(source, os.R_OK):
-                logging.error(f"Video file is not readable: {source}")
-                return False
-            
-            # Check file size
-            file_size = os.path.getsize(source)
-            if file_size == 0:
-                logging.error(f"Video file is empty: {source}")
-                return False
-            
-            logging.info(f"Video file validated: {source} ({file_size} bytes)")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error validating video file {source}: {e}")
-            return False
-
-    def _handle_read_failure(self):
-        """Enhanced read failure handling with proper video looping"""
-        self.consecutive_failures += 1
-        
-        # Special handling for file sources (like your fire1.mp4)
-        if self._is_file_source(self.source) and self.cap and self.cap.isOpened():
-            try:
-                current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                
-                logging.debug(f"Video position for {self.source}: {current_pos}/{total_frames}")
-                
-                # Check if we've reached the end of the video
-                if total_frames > 0 and (current_pos >= total_frames - 1 or current_pos >= total_frames):
-                    logging.info(f"End of video file reached for {self.source} ({current_pos}/{total_frames}), looping to start")
-                    
-                    # Reset to beginning
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    
-                    # Test if reset worked
-                    ret, test_frame = self.cap.read()
-                    if ret and test_frame is not None:
-                        logging.info(f"Successfully looped video {self.source} back to start")
-                        # Reset the frame position again for next read
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        # Reset failure counters
-                        self.consecutive_failures = 0
-                        self.reconnect_attempts = 0
-                        return
-                    else:
-                        logging.warning(f"Failed to read after loop reset for {self.source}")
-                
-                # If position is valid but read failed, might be a temporary issue
-                elif current_pos < total_frames - 5:  # Not near the end
-                    logging.warning(f"Read failed mid-video for {self.source} at position {current_pos}")
-                    # Don't increment reconnect_attempts for mid-video failures
-                    if self.consecutive_failures < 5:
-                        return  # Give it another chance without reconnecting
-                        
-            except Exception as e:
-                logging.warning(f"Error checking video position for {self.source}: {e}")
-        
-        # If we get here, either it's not a file or the loop didn't work
-        self.reconnect_attempts += 1
-        
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            logging.error(f"Max reconnect attempts ({self.max_reconnect_attempts}) reached for {self.source}")
-            self.is_running = False
+    def _safe_release_capture(self):
+        """
+        Safely release VideoCapture with proper error handling.
+        CRITICAL: Prevents "NoneType has no attribute 'release'" errors.
+        """
+        if self.cap is None:
             return
         
-        # For short videos, use shorter delays to restart quickly
-        if self._is_file_source(self.source):
-            base_delay = 1.0  # Shorter delay for files
-            max_delay = 5.0   # Max 5 seconds for files
-        else:
-            base_delay = 2.0  # Longer delay for streams
-            max_delay = 30.0
+        try:
+            # Acquire lock to ensure thread safety
+            with self._capture_lock:
+                if self.cap is not None:  # Double-check after acquiring lock
+                    try:
+                        if self.cap.isOpened():
+                            self.cap.release()
+                            logging.debug(f"✓ Released VideoCapture for {self.source}")
+                        else:
+                            logging.debug(f"VideoCapture already closed for {self.source}")
+                    except Exception as e:
+                        logging.warning(f"Error during cap.release() for {self.source}: {e}")
+                    finally:
+                        self.cap = None  # Always set to None
+        except Exception as e:
+            logging.error(f"Error in _safe_release_capture for {self.source}: {e}")
+            self.cap = None  # Ensure it's set to None even on error
+    
+    def _stop_capture(self):
+        """
+        Stop the video capture thread with safe cleanup.
+        FIXED: Proper None checks and error handling.
+        """
+        if not self.is_running:
+            return
         
-        delay = min(max_delay, base_delay * (1.5 ** (self.reconnect_attempts - 1)))
-        jitter = random.uniform(0.1, 0.5)
-        total_delay = delay + jitter
+        logging.info(f"Stopping capture for {self.source}")
+        self.is_running = False
+        self.stop_capture.set()
         
-        logging.warning(f"Read failure for {self.source}, attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}. "
-                    f"Retrying in {total_delay:.1f}s")
+        # Release capture to unblock read()
+        self._safe_release_capture()
         
-        time.sleep(total_delay)
+        # Wait for thread with timeout
+        if self.capture_thread and self.capture_thread.is_alive():
+            timeout = 10.0 if self.is_rtsp_source else 5.0
+            
+            logging.debug(f"Waiting for capture thread (timeout: {timeout}s)")
+            self.capture_thread.join(timeout=timeout)
+            
+            if self.capture_thread.is_alive():
+                logging.warning(
+                    f"⚠️ Capture thread for {self.source} did not stop within {timeout}s. "
+                    f"Thread will be abandoned (daemon=True)."
+                )
         
-        # Force re-open the video source
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-
+        self.capture_thread = None
+        logging.info(f"✓ Stopped capture for {self.source}")
+    
     def _capture_loop(self):
-        """Enhanced capture loop for short video files"""
+        """
+        Main capture loop with safe cleanup in finally block.
+        FIXED: All release() calls now use safe method.
+        """
         logging.info(f"Capture loop started for {self.source}")
         
-        # For file sources, get video info
-        video_duration = None
-        video_fps = None
-        total_frames = None
+        # Configure RTSP if needed
+        if self.is_rtsp_source:
+            self._configure_rtsp_environment()
         
-        if self._is_file_source(self.source):
+        # Get video info
+        video_fps = None
+        if self.is_file_source:
             try:
                 test_cap = cv2.VideoCapture(self.source)
                 if test_cap.isOpened():
                     video_fps = test_cap.get(cv2.CAP_PROP_FPS)
                     total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    video_duration = total_frames / video_fps if video_fps > 0 else None
-                    logging.info(f"Video info for {self.source}: {total_frames} frames, {video_fps:.1f} FPS, {video_duration:.1f}s duration")
-                test_cap.release()
+                    logging.info(f"Video: {total_frames} frames, {video_fps:.1f} FPS")
+                test_cap.release()  # This is safe - we just created it
             except Exception as e:
-                logging.warning(f"Could not get video info for {self.source}: {e}")
+                logging.warning(f"Could not get video info: {e}")
+        
+        last_successful_read = time.time()
+        read_timeout = 30.0
         
         try:
             while not self.stop_capture.is_set() and self.is_running:
                 try:
+                    # Check stop signal
+                    if self.stop_capture.is_set() or not self.is_running:
+                        logging.info(f"Stop signal received for {self.source}")
+                        break
+                    
                     # Open video source if needed
                     if self.cap is None or not self.cap.isOpened():
                         if not self._open_video_source():
-                            delay = min(10.0, 2.0 * (2 ** min(self.reconnect_attempts, 3)))
-                            logging.warning(f"Failed to open {self.source}, retrying in {delay:.1f}s")
-                            time.sleep(delay)
+                            delay = self.rtsp_reconnect_delay if self.is_rtsp_source else 2.0
+                            logging.warning(f"Failed to open {self.source}, retry in {delay}s")
+                            
+                            # Sleep with stop checks
+                            for _ in range(int(delay * 10)):
+                                if self.stop_capture.is_set():
+                                    break
+                                time.sleep(0.1)
+                            
                             self.reconnect_attempts += 1
                             continue
                     
-                    # Read frame
-                    ret, frame = self.cap.read()
+                    # CRITICAL: Thread-safe read with proper None check
+                    frame_read_successful = False
+                    ret = False
+                    frame = None
                     
-                    if not ret or frame is None:
+                    # Acquire lock for reading
+                    with self._capture_lock:
+                        # Triple-check everything is valid
+                        if (not self.stop_capture.is_set() and 
+                            self.is_running and 
+                            self.cap is not None and
+                            self.cap.isOpened()):
+                            
+                            try:
+                                ret, frame = self.cap.read()
+                                frame_read_successful = True
+                            except Exception as read_error:
+                                logging.error(f"Exception during cap.read(): {read_error}")
+                                ret = False
+                                frame = None
+                    
+                    # Check stop again after read
+                    if self.stop_capture.is_set() or not self.is_running:
+                        break
+                    
+                    if not frame_read_successful or not ret or frame is None:
                         self._handle_read_failure()
+                        
+                        # Check timeout for RTSP
+                        if self.is_rtsp_source:
+                            time_since_success = time.time() - last_successful_read
+                            if time_since_success > read_timeout:
+                                logging.error(f"No frames for {time_since_success:.1f}s")
+                                break
+                        
                         continue
                     
-                    # Validate frame quality
+                    # Validate frame
                     if frame.size == 0 or len(frame.shape) != 3:
-                        logging.warning(f"Invalid frame received from {self.source}")
+                        logging.warning(f"Invalid frame from {self.source}")
                         self._handle_read_failure()
                         continue
                     
                     # Successfully read frame
+                    last_successful_read = time.time()
                     self.reconnect_attempts = 0
-                    self.error_count = 0
                     self.consecutive_failures = 0
                     self.frame_count += 1
                     self.last_frame_time = time.time()
                     self.last_successful_read = time.time()
                     
-                    # Update latest frame
+                    # Update latest frame (thread-safe)
                     with self.lock:
-                        self.latest_frame = frame.copy()
+                        self.latest_frame = frame
                         self.frame_available.set()
                         self.frame_available.clear()
                     
-                    # Frame rate control based on video type
-                    if self._is_file_source(self.source) and video_fps and video_fps > 0:
-                        # For files, respect the original FPS but cap at 30
+                    # Frame rate control
+                    if self.is_rtsp_source:
+                        sleep_time = 0.01
+                    elif self.is_file_source and video_fps and video_fps > 0:
                         target_fps = min(video_fps, 30.0)
                         sleep_time = 1.0 / target_fps
                     else:
-                        # For streams or unknown FPS, use default
-                        sleep_time = 0.033  # ~30 FPS
+                        sleep_time = 0.033
                     
-                    time.sleep(sleep_time)
+                    # Sleep with stop checks
+                    if sleep_time > 0.01:
+                        for _ in range(int(sleep_time * 100)):
+                            if self.stop_capture.is_set():
+                                break
+                            time.sleep(0.01)
+                    else:
+                        time.sleep(sleep_time)
                     
                 except Exception as e:
                     self.last_error = str(e)
                     self.error_count += 1
                     self.consecutive_failures += 1
-                    logging.error(f"Error in capture loop for {self.source}: {e}")
+                    logging.error(f"Error in capture loop: {e}")
                     
-                    if self.consecutive_failures > 20:  # Reduced threshold
-                        logging.error(f"Too many consecutive failures for {self.source}, stopping")
+                    max_failures = 10 if self.is_rtsp_source else 20
+                    if self.consecutive_failures > max_failures:
+                        logging.error(f"Too many failures, stopping")
                         break
                     
-                    time.sleep(1.0)
+                    # Sleep with stop checks
+                    for _ in range(10):
+                        if self.stop_capture.is_set():
+                            break
+                        time.sleep(0.1)
         
         except Exception as e:
-            logging.error(f"Fatal error in capture loop for {self.source}: {e}", exc_info=True)
+            logging.error(f"Fatal error in capture loop: {e}", exc_info=True)
         
         finally:
-            if self.cap:
-                self.cap.release()
-                self.cap = None
+            # CRITICAL: Safe cleanup in finally block
+            logging.info(f"Capture loop cleanup starting for {self.source}")
+            self._safe_release_capture()
             self.is_running = False
-            logging.info(f"Capture loop ended for {self.source}")
-
-    def _open_video_source(self) -> bool:
-        """Enhanced video source opening with multiple backend attempts"""
-        try:
-            if self.cap:
-                self.cap.release()
-                time.sleep(0.2)  # Brief pause for cleanup
-            
-            # Validate file if it's a local file
-            if self._is_file_source(self.source):
-                if not self._validate_file_source(self.source):
-                    return False
-            
-            # Try different backends in order of preference
-            backends_to_try = []
-            
-            if self._is_file_source(self.source):
-                # For file sources - your system supports both CAP_FFMPEG and CAP_ANY
-                backends_to_try = [
-                    cv2.CAP_FFMPEG,  # Best for video files
-                    cv2.CAP_ANY      # Fallback that works
-                ]
-            else:
-                # For stream sources (RTSP, HTTP, etc.)
-                backends_to_try = [
-                    cv2.CAP_FFMPEG,  # Best for most streaming protocols
-                    cv2.CAP_ANY      # Fallback
-                ]
-            
-            for i, backend in enumerate(backends_to_try):
-                try:
-                    logging.info(f"Attempting to open {self.source} with backend {backend} (attempt {i+1}/{len(backends_to_try)})")
-                    
-                    self.cap = cv2.VideoCapture(self.source, backend)
-                    
-                    if not self.cap or not self.cap.isOpened():
-                        if self.cap:
-                            self.cap.release()
-                        continue
-                    
-                    # Configure buffer size
-                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    
-                    # Test read to ensure it works
-                    ret, test_frame = self.cap.read()
-                    if not ret or test_frame is None or test_frame.size == 0:
-                        logging.warning(f"Backend {backend} opened but cannot read frames")
-                        self.cap.release()
-                        self.cap = None
-                        continue
-                    
-                    # Reset to beginning for file sources
-                    if self._is_file_source(self.source):
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        
-                        # Log video properties
+            logging.info(f"✓ Capture loop ended for {self.source}")
+    
+    def _handle_read_failure(self):
+        """
+        Handle read failures with safe cleanup.
+        FIXED: Use safe release method.
+        """
+        self.consecutive_failures += 1
+        
+        # Video looping for files
+        if self.is_file_source and self.cap is not None:
+            try:
+                with self._capture_lock:
+                    if self.cap is not None and self.cap.isOpened():
+                        current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
                         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        fps = self.cap.get(cv2.CAP_PROP_FPS)
-                        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         
-                        logging.info(f"Video opened successfully: {width}x{height}, {total_frames} frames, {fps:.2f} FPS")
+                        # End of video - loop
+                        if total_frames > 0 and current_pos >= total_frames - 1:
+                            logging.info(f"End of video, looping: {self.source}")
+                            
+                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            
+                            # Test read
+                            ret, test_frame = self.cap.read()
+                            
+                            if ret and test_frame is not None:
+                                logging.info(f"Successfully looped video")
+                                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                self.consecutive_failures = 0
+                                self.reconnect_attempts = 0
+                                return
+                            
+            except Exception as e:
+                logging.warning(f"Error handling video loop: {e}")
+        
+        # RTSP reconnection
+        elif self.is_rtsp_source:
+            self.reconnect_attempts += 1
+            
+            if self.reconnect_attempts >= self.max_reconnect_attempts:
+                logging.error(f"Max RTSP reconnect attempts reached")
+                self.is_running = False
+                return
+            
+            delay = self.rtsp_reconnect_delay
+            logging.warning(
+                f"RTSP failure, retry in {delay}s "
+                f"(attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
+            )
+            
+            time.sleep(delay)
+            
+            # Force re-open using safe method
+            self._safe_release_capture()
+            return
+        
+        # Generic handling
+        self.reconnect_attempts += 1
+        
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            logging.error(f"Max reconnect attempts reached")
+            self.is_running = False
+            return
+        
+        base_delay = 1.0 if self.is_file_source else 2.0
+        max_delay = 5.0 if self.is_file_source else 30.0
+        
+        delay = min(max_delay, base_delay * (1.5 ** (self.reconnect_attempts - 1)))
+        jitter = random.uniform(0.1, 0.5)
+        total_delay = delay + jitter
+        
+        logging.warning(
+            f"Read failure, retry in {total_delay:.1f}s "
+            f"(attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
+        )
+        
+        time.sleep(total_delay)
+        
+        # Force re-open using safe method
+        self._safe_release_capture()
+    
+    def _open_video_source(self) -> bool:
+        """
+        Open video source with safe cleanup.
+        FIXED: Use safe release method, proper None checks.
+        """
+        try:
+            # CRITICAL: Safe cleanup of existing capture
+            self._safe_release_capture()
+            
+            # Small delay before reopening
+            time.sleep(0.2)
+            
+            # Acquire lock for opening
+            with self._capture_lock:
+                # Validate file source
+                if self.is_file_source:
+                    if not self._validate_file_source(self.source):
+                        return False
+                
+                # RTSP opening
+                if self.is_rtsp_source:
+                    logging.info(f"Opening RTSP stream: {self.source}")
                     
-                    logging.info(f"Successfully opened {self.source} with backend {backend}")
-                    return True
+                    self._configure_rtsp_environment()
                     
-                except Exception as e:
-                    logging.warning(f"Backend {backend} failed for {self.source}: {e}")
-                    if self.cap:
-                        self.cap.release()
+                    try:
+                        self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                    except Exception as e:
+                        logging.error(f"Failed to create VideoCapture: {e}")
                         self.cap = None
-                    continue
-            
-            logging.error(f"All backends failed to open {self.source}")
-            return False
-            
+                        return False
+                    
+                    if self.cap is None or not self.cap.isOpened():
+                        logging.error(f"Failed to open RTSP: {self.source}")
+                        if self.cap is not None:
+                            try:
+                                self.cap.release()
+                            except:
+                                pass
+                        self.cap = None
+                        return False
+                    
+                    # Set properties
+                    try:
+                        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.rtsp_timeout * 1000)
+                        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.rtsp_timeout * 1000)
+                        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception as e:
+                        logging.warning(f"Could not set RTSP properties: {e}")
+                    
+                    # Test read
+                    try:
+                        ret, test_frame = self.cap.read()
+                    except Exception as e:
+                        logging.error(f"Test read failed: {e}")
+                        ret = False
+                        test_frame = None
+                    
+                    if not ret or test_frame is None:
+                        logging.error(f"RTSP opened but cannot read frames")
+                        try:
+                            self.cap.release()
+                        except:
+                            pass
+                        self.cap = None
+                        return False
+                    
+                    width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    fps = self.cap.get(cv2.CAP_PROP_FPS)
+                    
+                    logging.info(f"✓ RTSP connected: {width}x{height} @ {fps}fps")
+                    return True
+                
+                # File opening
+                backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY]
+                
+                for backend in backends:
+                    try:
+                        logging.info(f"Trying backend {backend} for {self.source}")
+                        
+                        try:
+                            self.cap = cv2.VideoCapture(self.source, backend)
+                        except Exception as e:
+                            logging.warning(f"Failed to create VideoCapture with backend {backend}: {e}")
+                            self.cap = None
+                            continue
+                        
+                        if self.cap is None or not self.cap.isOpened():
+                            if self.cap is not None:
+                                try:
+                                    self.cap.release()
+                                except:
+                                    pass
+                            self.cap = None
+                            continue
+                        
+                        try:
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        except Exception as e:
+                            logging.warning(f"Could not set buffer size: {e}")
+                        
+                        # Test read
+                        try:
+                            ret, test_frame = self.cap.read()
+                        except Exception as e:
+                            logging.warning(f"Test read failed with backend {backend}: {e}")
+                            ret = False
+                            test_frame = None
+                        
+                        if not ret or test_frame is None:
+                            logging.warning(f"Backend {backend} cannot read")
+                            try:
+                                self.cap.release()
+                            except:
+                                pass
+                            self.cap = None
+                            continue
+                        
+                        # Reset for files
+                        if self.is_file_source:
+                            try:
+                                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            except Exception as e:
+                                logging.warning(f"Could not reset frame position: {e}")
+                        
+                        logging.info(f"Successfully opened with backend {backend}")
+                        return True
+                        
+                    except Exception as e:
+                        logging.warning(f"Backend {backend} failed: {e}")
+                        if self.cap is not None:
+                            try:
+                                self.cap.release()
+                            except:
+                                pass
+                        self.cap = None
+                        continue
+                
+                logging.error(f"All backends failed for {self.source}")
+                return False
+                
         except Exception as e:
             logging.error(f"Critical error opening {self.source}: {e}", exc_info=True)
-            if self.cap:
-                self.cap.release()
-                self.cap = None
+            self._safe_release_capture()
             return False
+    
+    def __del__(self):
+        """
+        Destructor to ensure cleanup on object deletion.
+        FIXED: Safe cleanup when object is garbage collected.
+        """
+        try:
+            if hasattr(self, 'is_running') and self.is_running:
+                self._stop_capture()
+        except Exception as e:
+            logging.debug(f"Error in __del__ for {self.source}: {e}")
 
 class VideoFileManager:
     """Manages shared video streams to prevent file conflicts"""
@@ -441,7 +658,6 @@ class VideoFileManager:
         with self.lock:
             if source in self.shared_streams:
                 shared_stream = self.shared_streams[source]
-                # Stop the stream if it's running
                 if shared_stream.is_running:
                     shared_stream._stop_capture()
                 del self.shared_streams[source]
@@ -472,16 +688,12 @@ class VideoFileManager:
             if source_path in self.shared_streams:
                 shared_stream = self.shared_streams[source_path]
                 
-                # Get list of affected stream IDs
                 affected_stream_ids = list(shared_stream.subscribers.keys())
                 
-                # Stop the shared stream
                 shared_stream._stop_capture()
                 
-                # Wait a moment
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(5.0)
                 
-                # Restart will happen automatically when subscribers reconnect
                 logging.info(f"Force restarted shared stream for {source_path}. Affected streams: {affected_stream_ids}")
                 return True
             
