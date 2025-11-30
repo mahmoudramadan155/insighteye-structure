@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict, Optional, List
 from uuid import UUID
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from app.services.database import db_manager
 
@@ -134,7 +135,7 @@ class FireDetectionService:
                 WHERE stream_id NOT IN (SELECT stream_id FROM video_stream)"""
             )
             
-            day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+            day_ago = datetime.now(ZoneInfo("Africa/Cairo")) - timedelta(days=1)
             await self.db_manager.execute_query(
                 """UPDATE fire_detection_state 
                 SET fire_status = 'no detection', last_notification_time = NULL 

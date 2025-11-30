@@ -2,6 +2,7 @@
 from typing import List, Dict, Any, Optional, Union
 from uuid import UUID, uuid4
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import logging
 from app.services.database import db_manager
 from app.schemas import StreamUpdate
@@ -816,7 +817,7 @@ class PostgresService:
     async def cleanup_old_notifications(self, days: int = 30) -> int:
         """Delete notifications older than specified days"""
         query = "DELETE FROM notifications WHERE created_at < $1"
-        threshold = datetime.now(timezone.utc) - timedelta(days=days)
+        threshold = datetime.now(ZoneInfo("Africa/Cairo")) - timedelta(days=days)
         
         rows_affected = await self.db_manager.execute_query(
             query, (threshold,), return_rowcount=True
@@ -1269,7 +1270,7 @@ class PostgresService:
         rows1 = await self.db_manager.execute_query(query1, return_rowcount=True)
         
         # Clear old notification times (older than 24 hours)
-        day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        day_ago = datetime.now(ZoneInfo("Africa/Cairo")) - timedelta(days=1)
         query2 = """
             UPDATE fire_detection_state 
             SET last_notification_time = NULL 

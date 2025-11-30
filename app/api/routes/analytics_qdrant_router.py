@@ -18,7 +18,7 @@ from app.utils import (
 from qdrant_client.http import models as qdrant_models
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/analytics", tags=["Analytics"])
+router = APIRouter(prefix="/analytics-qdrant", tags=["Analytics-Qdrant"])
 
 
 # ========== Helper Functions ==========
@@ -818,21 +818,39 @@ async def get_people_by_floor_and_weekday(
     """
     user_id_obj = current_user_data["user_id"]
     username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
     
     try:
-        workspace_id_obj = await get_workspace_and_check_access(username, user_id_obj)
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
         
-        client = qdrant_service.get_client()
+        # Get Qdrant collection
         collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
         await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
         
-        # Build filter
-        must_conditions = _build_date_filter(start_date, end_date)
-        filter_obj = qdrant_models.Filter(must=must_conditions) if must_conditions else None
+        # Build filter with correct arguments
+        filter_obj = _build_date_filter(
+            start_date, 
+            end_date, 
+            user_system_role, 
+            user_workspace_role, 
+            username
+        )
         
         # Fetch all points
-        all_points = qdrant_service._fetch_all_points_with_payload(
-            client, collection_name, filter_obj,
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
             ["floor_level", "timestamp", "person_count"]
         )
         
@@ -841,6 +859,8 @@ async def get_people_by_floor_and_weekday(
             "total_count": 0,
             "sample_size": 0
         })
+        
+        weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         
         for point in all_points:
             if point.payload:
@@ -851,24 +871,24 @@ async def get_people_by_floor_and_weekday(
                 if timestamp:
                     dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                     weekday_num = dt.weekday()
-                    weekday_name = dt.strftime('%A')
+                    weekday_name = weekday_names[weekday_num]
                     
                     key = (floor_level, weekday_num, weekday_name)
                     stats = floor_weekday_stats[key]
                     stats["total_count"] += person_count
                     stats["sample_size"] += 1
         
-        # Format data
+        # Convert to list and calculate averages
         data = []
         for (floor_level, weekday_num, weekday_name), stats in floor_weekday_stats.items():
-            avg_count = stats["total_count"] / stats["sample_size"] if stats["sample_size"] > 0 else 0
-            data.append({
-                "floor_level": floor_level,
-                "weekday_name": weekday_name,
-                "weekday_num": weekday_num,
-                "avg_person_count": round(avg_count, 2),
-                "sample_size": stats["sample_size"]
-            })
+            if stats["sample_size"] > 0:
+                data.append({
+                    "floor_level": floor_level,
+                    "weekday_name": weekday_name,
+                    "weekday_num": weekday_num,
+                    "avg_person_count": round(stats["total_count"] / stats["sample_size"], 2),
+                    "sample_size": stats["sample_size"]
+                })
         
         # Sort by weekday then floor
         data.sort(key=lambda x: (x["weekday_num"], x["floor_level"]))
@@ -882,7 +902,7 @@ async def get_people_by_floor_and_weekday(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching floor/weekday data: {e}", exc_info=True)
+        logger.error(f"Error fetching floor/weekday data from Qdrant: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

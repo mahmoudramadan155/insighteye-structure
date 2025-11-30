@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 import re
 import pyotp 
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import json
 import hashlib
 import requests
@@ -684,7 +685,7 @@ class UserManager:
         rows_affected = 0
         subscription_date_val: Optional[datetime] = None 
         if is_subscribed:
-            subscription_date_val = datetime.now(timezone.utc) + timedelta(days=30*months)
+            subscription_date_val = datetime.now(ZoneInfo("Africa/Cairo")) + timedelta(days=30*months)
             query = "UPDATE users SET is_subscribed = $1, subscription_date = $2 WHERE user_id = $3"
             rows_affected = await self.db_manager.execute_query(query, (is_subscribed, subscription_date_val, user_id), return_rowcount=True)
         else: 

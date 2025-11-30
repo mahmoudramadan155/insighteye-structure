@@ -10,6 +10,7 @@ from app.services.user_service import user_manager
 import uuid 
 from uuid import UUID, uuid4
 import secrets 
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone 
 from app.schemas import TokenPair, TokenData
 import jwt
@@ -115,11 +116,11 @@ class SessionManager:
         else:
             raise ValueError("Invalid token_type specified")
 
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = datetime.now(ZoneInfo("Africa/Cairo")) + expires_delta
         to_encode.update({
             "exp": expire, 
             "token_type": token_type, 
-            "iat": datetime.now(timezone.utc),
+            "iat": datetime.now(ZoneInfo("Africa/Cairo")),
             "jti": jti
         })
         
@@ -197,7 +198,7 @@ class SessionManager:
             expires_at_dt = datetime.fromtimestamp(expires_at_timestamp, tz=timezone.utc)
         except PyJWTError as e: 
             logger.error(f"Error decoding newly created access token to get exp: {e}")
-            expires_at_dt = datetime.now(timezone.utc) + timedelta(minutes=self.ACCESS_TOKEN_EXPIRE_MINUTES)
+            expires_at_dt = datetime.now(ZoneInfo("Africa/Cairo")) + timedelta(minutes=self.ACCESS_TOKEN_EXPIRE_MINUTES)
 
         return TokenPair(
             access_token=access_token,

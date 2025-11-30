@@ -13,6 +13,7 @@ models/
 models/*
 nemo_msdd_configs/
 uploads/
+versions/
 videos/
 volumes/
 chromadb/

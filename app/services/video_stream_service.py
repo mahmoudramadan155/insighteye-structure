@@ -198,7 +198,8 @@ class VideoStreamService:
         self,
         stream_id: UUID,
         status: str,
-        is_streaming: Optional[bool] = None
+        is_streaming: Optional[bool] = None,
+        last_activity: Optional[datetime] = None
     ) -> bool:
         """
         Update stream status in database.
@@ -211,10 +212,10 @@ class VideoStreamService:
                 # Explicit is_streaming value provided
                 query = """
                     UPDATE video_stream 
-                    SET status = $1, is_streaming = $2, updated_at = NOW(), last_activity = NOW()
-                    WHERE stream_id = $3
+                    SET status = $1, is_streaming = $2, updated_at = $3, last_activity = $3
+                    WHERE stream_id = $4
                 """
-                await self.db_manager.execute_query(query, (status, is_streaming, stream_id))
+                await self.db_manager.execute_query(query, (status, is_streaming, last_activity, stream_id))
                 logger.info(f"Updated stream {stream_id}: status={status}, is_streaming={is_streaming}")
             else:
                 # Only update status, leave is_streaming unchanged

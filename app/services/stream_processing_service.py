@@ -717,8 +717,18 @@ class StreamProcessingService:
                         
                         logger.debug(f"📊 Periodic update: {stream_id_str} -> status=active, is_streaming=TRUE")
                         try:
-                            await video_stream_service.update_stream_status(
-                                stream_id, "active", is_streaming=True  # Always explicit True
+                            # await video_stream_service.update_stream_status(
+                            #     stream_id, "active", is_streaming=True, last_activity=current_time  # Always explicit True
+                            # )
+
+                            await self.db_manager.execute_query(
+                                """UPDATE video_stream 
+                                SET status = 'active', 
+                                    is_streaming = TRUE,
+                                    last_activity = $1,
+                                    updated_at = $1
+                                WHERE stream_id = $2""",
+                                (current_time, stream_id)
                             )
                             last_db_update_activity = current_time
                         except Exception as e:

@@ -6,6 +6,7 @@ import logging
 import asyncio
 from uuid import UUID, uuid4
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
 from app.utils import frame_to_base64, check_workspace_access
 from app.config.settings import config
@@ -548,7 +549,7 @@ async def debug_fire_state(
         
         cooldown_info = {}
         if persistent_state['last_notification_time']:
-            time_since_last = (datetime.now(timezone.utc) - persistent_state['last_notification_time']).total_seconds()
+            time_since_last = (datetime.now(ZoneInfo("Africa/Cairo")) - persistent_state['last_notification_time']).total_seconds()
             cooldown_info = {
                 'time_since_last_notification': time_since_last,
                 'cooldown_remaining': max(0, stream_manager.fire_cooldown_duration - time_since_last),

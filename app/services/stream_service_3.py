@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Any, Set, Tuple, Union
 from uuid import UUID
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -577,7 +578,7 @@ class StreamManager:
                 # Update database status
                 logger.info(f"💾 Updating database: is_streaming=TRUE, status='processing'")
                 await self.video_stream_service.update_stream_status(
-                    stream_id, 'processing', is_streaming=True  
+                    stream_id, 'processing', is_streaming=True, last_activity=datetime.now(ZoneInfo("Africa/Cairo"))  
                 )
                 logger.info(f"✅ Database updated successfully")
 
@@ -697,7 +698,7 @@ class StreamManager:
                 
                 # Update database
                 await self.video_stream_service.update_stream_status(
-                    stream_id, 'error', is_streaming=True  
+                    stream_id, 'error', is_streaming=True, last_activity=datetime.now(ZoneInfo("Africa/Cairo"))  
                 )
 
                 logger.warning(
@@ -784,7 +785,7 @@ class StreamManager:
         # Calculate stream duration for metrics
         start_time = stream_info.get('start_time')
         if start_time:
-            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+            duration = (datetime.now(ZoneInfo("Africa/Cairo")) - start_time).total_seconds()
             # Update running average
             current_avg = self.metrics['avg_stream_duration']
             total_stopped = self.metrics['total_streams_stopped']
@@ -1269,10 +1270,7 @@ class StreamManager:
                         AND u.is_active = TRUE
                         AND w.is_active = TRUE
                         AND (u.is_subscribed = TRUE OR u.role = 'admin')
-                        -- CRITICAL FIX: Explicitly include active/processing streams
-                        AND vs.status IN ('active', 'processing', 'starting')
-                        -- Exclude only intentional stops
-                        AND vs.status NOT IN ('stopping', 'inactive', 'error')
+                        AND vs.status NOT IN ('stopping', 'inactive')
                 """
                 
                 potential_streams_db = await self.db_manager.execute_query(
@@ -1313,7 +1311,7 @@ class StreamManager:
                                 last_frame = stream_info.get('last_frame_time')
                                 if last_frame:
                                     time_since_frame = (
-                                        datetime.now(timezone.utc) - last_frame
+                                        datetime.now(ZoneInfo("Africa/Cairo")) - last_frame
                                     ).total_seconds()
                                     
                                     # CRITICAL: Don't stop if actively processing
@@ -1676,7 +1674,7 @@ class StreamManager:
                     if stream_id not in self.active_streams:
                         last_error = self.stream_errors[stream_id][-1] if self.stream_errors[stream_id] else None
                         if last_error:
-                            age = (datetime.now(timezone.utc) - last_error['timestamp']).total_seconds()
+                            age = (datetime.now(ZoneInfo("Africa/Cairo")) - last_error['timestamp']).total_seconds()
                             if age > 86400:
                                 del self.stream_errors[stream_id]
 
@@ -1747,10 +1745,10 @@ class StreamManager:
         """
         async with self._health_lock:
             # Prevent concurrent health checks
-            if (datetime.now(timezone.utc) - self.last_healthcheck).total_seconds() <= self.healthcheck_interval / 2:
+            if (datetime.now(ZoneInfo("Africa/Cairo")) - self.last_healthcheck).total_seconds() <= self.healthcheck_interval / 2:
                 return
 
-            current_time_utc = datetime.now(timezone.utc)
+            current_time_utc = datetime.now(ZoneInfo("Africa/Cairo"))
             streams_to_restart_ids = []
             health_issues = []
             
@@ -1809,7 +1807,7 @@ class StreamManager:
                             current_time_utc - last_activity_time_mem
                         ).total_seconds()
 
-                    stale_threshold = config.get("stream_stale_threshold_seconds", 120.0)
+                    stale_threshold = config.get("stream_stale_threshold_seconds", 300.0)
                     if time_since_last_frame > stale_threshold:
                         health_issues.append(
                             f"{stream_id_str}: frozen ({time_since_last_frame:.0f}s since last frame)"
