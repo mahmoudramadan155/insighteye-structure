@@ -144,6 +144,8 @@ from app.schemas.camera_schemas import (
     StreamUpdateWithLocation,
     CameraCSVRecord,
     CameraCSVRecordWithLocation,
+    UserCameraCountUpdate,
+    UserCameraCountResponse,
 )
 
 # Alert Management
@@ -351,7 +353,8 @@ __all__ = [
     'StreamUpdate', 'StreamUpdateList', 'StreamDelete', 'CameraState',
     'CamerasStateResponse', 'StreamCreateWithLocation',
     'StreamUpdateWithLocation', 'CameraCSVRecord',
-    'CameraCSVRecordWithLocation',
+    'CameraCSVRecordWithLocation', 'UserCameraCountUpdate', 
+    'UserCameraCountResponse',
     
     # Alert
     'ThresholdSettings', 'CameraAlertSettings',

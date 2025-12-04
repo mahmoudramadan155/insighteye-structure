@@ -19,6 +19,7 @@ from app.config.settings import config
 from app.utils import send_people_count_alert_email, send_fire_alert_email
 from app.services.database import db_manager
 from app.services.user_service import user_manager
+from app.services.postgres_service import postgres_service
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class StreamProcessingService:
 
     def __init__(self):
         self.db_manager = db_manager
+        self.postgres_service  = postgres_service 
         self.people_model = None
         self.gender_model = None
         self.fire_model = None
@@ -272,7 +274,7 @@ class StreamProcessingService:
             logger.error(f"Error validating source {source}: {e}")
             return False
 
-    async def _save_detection_to_qdrant(
+    async def _save_detection(
         self,
         stream_id_str: str,
         camera_name: str,
@@ -286,38 +288,80 @@ class StreamProcessingService:
         location_info: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
-        Save detection data to Qdrant database.
+        Save detection data to both Qdrant and PostgreSQL databases.
         This is called periodically based on frame_skip configuration.
         """
+        qdrant_success = False
+        postgres_success = False
+        
         try:
-            if not self.qdrant_service:
-                logger.warning("Qdrant service not initialized, skipping data save")
-                return False
-            
-            # Insert detection data with location information
-            success = await self.qdrant_service.insert_detection_data(
-                username=owner_username,
-                camera_id_str=stream_id_str,
-                camera_name=camera_name,
-                count=person_count,
-                male_count=male_count,
-                female_count=female_count,
-                fire_status=fire_status,
-                frame=frame,
-                workspace_id=workspace_id,
-                location_info=location_info
-            )
-            
-            if success:
-                logger.debug(f"Saved detection data to Qdrant for stream {stream_id_str}: "
-                           f"count={person_count}, male={male_count}, female={female_count}, fire={fire_status}")
+            # Save to Qdrant
+            if self.qdrant_service:
+                qdrant_success = await self.qdrant_service.insert_detection_data(
+                    username=owner_username,
+                    camera_id_str=stream_id_str,
+                    camera_name=camera_name,
+                    count=person_count,
+                    male_count=male_count,
+                    female_count=female_count,
+                    fire_status=fire_status,
+                    frame=frame,
+                    workspace_id=workspace_id,
+                    location_info=location_info
+                )
+                
+                if qdrant_success:
+                    logger.debug(f"✅ Qdrant: Saved detection data for stream {stream_id_str}")
+                else:
+                    logger.warning(f"⚠️ Qdrant: Failed to save detection data for stream {stream_id_str}")
             else:
-                logger.warning(f"Failed to save detection data to Qdrant for stream {stream_id_str}")
+                logger.warning("Qdrant service not initialized, skipping Qdrant save")
             
-            return success
+            # Save to PostgreSQL
+            if self.postgres_service:
+                # Get user_id from stream info
+                from app.services.video_stream_service import video_stream_service
+                stream_info = await video_stream_service.get_video_stream_by_id(UUID(stream_id_str))
+                
+                if stream_info:
+                    postgres_success = await self.postgres_service.insert_detection_data(
+                        stream_id=UUID(stream_id_str),
+                        workspace_id=workspace_id,
+                        user_id=stream_info['user_id'],
+                        camera_name=camera_name,
+                        username=owner_username,
+                        person_count=person_count,
+                        male_count=male_count,
+                        female_count=female_count,
+                        fire_status=fire_status,
+                        frame=None,
+                        location_info=location_info,
+                        save_frame=False
+                    )
+                    
+                    if postgres_success:
+                        logger.debug(f"✅ PostgreSQL: Saved detection data for stream {stream_id_str}")
+                    else:
+                        logger.warning(f"⚠️ PostgreSQL: Failed to save detection data for stream {stream_id_str}")
+                else:
+                    logger.error(f"Could not get stream info for {stream_id_str}, skipping PostgreSQL save")
+            else:
+                logger.warning("PostgreSQL service not initialized, skipping PostgreSQL save")
+            
+            # Return success if at least one database succeeded
+            overall_success = qdrant_success or postgres_success
+            
+            if overall_success:
+                logger.debug(
+                    f"Detection saved for {stream_id_str}: "
+                    f"count={person_count}, male={male_count}, female={female_count}, fire={fire_status} "
+                    f"(Qdrant: {'✓' if qdrant_success else '✗'}, PostgreSQL: {'✓' if postgres_success else '✗'})"
+                )
+            
+            return overall_success
             
         except Exception as e:
-            logger.error(f"Error saving detection to Qdrant for stream {stream_id_str}: {e}", exc_info=True)
+            logger.error(f"Error saving detection data for stream {stream_id_str}: {e}", exc_info=True)
             return False
 
     async def verify_qdrant_save(
@@ -678,7 +722,7 @@ class StreamProcessingService:
                         should_save_to_qdrant = True
                     
                     if should_save_to_qdrant:
-                        save_success = await self._save_detection_to_qdrant(
+                        save_success = await self._save_detection(
                             stream_id_str=stream_id_str,
                             camera_name=camera_name,
                             owner_username=owner_username,

@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from app.services.database import db_manager
 
@@ -237,7 +238,7 @@ class NotificationService:
         workspace_id: Optional[UUID] = None
     ) -> int:
         """Delete notifications older than specified days."""
-        cutoff_date = datetime.now() - timedelta(days=days)
+        cutoff_date = datetime.now(ZoneInfo("Africa/Cairo")) - timedelta(days=days)
         
         if workspace_id:
             query = """
@@ -347,5 +348,5 @@ class NotificationService:
             """
         
         return await self.db_manager.execute_query(query, (workspace_id,), fetch_all=True)
-
+    
 notification_service = NotificationService()

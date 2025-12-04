@@ -1293,3 +1293,938 @@ async def get_camera_timeseries(
     except Exception as e:
         logger.error(f"Error fetching timeseries data from Qdrant: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/detection-summary")
+async def get_fire_detection_summary(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get summary of fire detections across all cameras from Qdrant
+    
+    Chart: Fire Detection Summary (Pie Chart / Stats Cards)
+    Returns: Count of fire detections by status
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        filter_obj = _build_date_filter(start_date, end_date, user_system_role, user_workspace_role, username)
+        
+        # Fetch all points
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
+            ["fire_status", "camera_id", "timestamp"]
+        )
+        
+        # Count by fire status
+        status_counts = defaultdict(lambda: {
+            "detection_count": 0,
+            "affected_cameras": set(),
+            "days_with_detections": set(),
+            "first_detection": None,
+            "last_detection": None
+        })
+        
+        for point in all_points:
+            if point.payload:
+                fire_status = point.payload.get("fire_status", "no detection")
+                camera_id = point.payload.get("camera_id")
+                timestamp = point.payload.get("timestamp")
+                
+                stats = status_counts[fire_status]
+                stats["detection_count"] += 1
+                
+                if camera_id:
+                    stats["affected_cameras"].add(camera_id)
+                
+                if timestamp:
+                    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                    stats["days_with_detections"].add(dt.date())
+                    
+                    if stats["first_detection"] is None or timestamp < stats["first_detection"]:
+                        stats["first_detection"] = timestamp
+                    if stats["last_detection"] is None or timestamp > stats["last_detection"]:
+                        stats["last_detection"] = timestamp
+        
+        # Convert to list format
+        data = []
+        total_detections = 0
+        fire_detections = 0
+        
+        for fire_status, stats in status_counts.items():
+            count = stats["detection_count"]
+            total_detections += count
+            
+            if fire_status != "no detection":
+                fire_detections += count
+            
+            data.append({
+                "fire_status": fire_status,
+                "detection_count": count,
+                "affected_cameras": len(stats["affected_cameras"]),
+                "days_with_detections": len(stats["days_with_detections"]),
+                "first_detection": datetime.fromtimestamp(stats["first_detection"], tz=timezone.utc).isoformat() if stats["first_detection"] else None,
+                "last_detection": datetime.fromtimestamp(stats["last_detection"], tz=timezone.utc).isoformat() if stats["last_detection"] else None
+            })
+        
+        # Sort by detection count
+        data.sort(key=lambda x: x["detection_count"], reverse=True)
+        
+        return {
+            "success": True,
+            "summary": {
+                "total_records": total_detections,
+                "fire_detections": fire_detections,
+                "no_detection_records": total_detections - fire_detections,
+                "fire_detection_percentage": round((fire_detections / total_detections * 100), 2) if total_detections > 0 else 0
+            },
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching fire detection summary from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/detections-by-camera")
+async def get_fire_detections_by_camera(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get fire detection counts per camera from Qdrant
+    
+    Chart: Fire Detections by Camera (Bar Chart)
+    Returns: Number of fire detections for each camera
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        filter_obj = _build_date_filter(start_date, end_date, user_system_role, user_workspace_role, username)
+        
+        # Fetch all points
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
+            ["camera_id", "name", "location", "area", "building", "zone", "fire_status", "timestamp"]
+        )
+        
+        # Calculate statistics per camera
+        camera_stats = defaultdict(lambda: {
+            "camera_name": None,
+            "camera_id": None,
+            "location": None,
+            "area": None,
+            "building": None,
+            "zone": None,
+            "total_checks": 0,
+            "fire_detections": 0,
+            "days_with_fire": set(),
+            "first_fire_detection": None,
+            "last_fire_detection": None
+        })
+        
+        for point in all_points:
+            if point.payload:
+                camera_id = point.payload.get("camera_id")
+                fire_status = point.payload.get("fire_status", "no detection")
+                timestamp = point.payload.get("timestamp")
+                
+                if camera_id:
+                    stats = camera_stats[camera_id]
+                    stats["camera_id"] = camera_id
+                    stats["camera_name"] = point.payload.get("name", "Unknown Camera")
+                    stats["location"] = point.payload.get("location")
+                    stats["area"] = point.payload.get("area")
+                    stats["building"] = point.payload.get("building")
+                    stats["zone"] = point.payload.get("zone")
+                    stats["total_checks"] += 1
+                    
+                    if fire_status != "no detection":
+                        stats["fire_detections"] += 1
+                        
+                        if timestamp:
+                            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                            stats["days_with_fire"].add(dt.date())
+                            
+                            if stats["first_fire_detection"] is None or timestamp < stats["first_fire_detection"]:
+                                stats["first_fire_detection"] = timestamp
+                            if stats["last_fire_detection"] is None or timestamp > stats["last_fire_detection"]:
+                                stats["last_fire_detection"] = timestamp
+        
+        # Convert to list and calculate rates
+        data = []
+        for stats in camera_stats.values():
+            fire_detection_rate = 0
+            if stats["total_checks"] > 0:
+                fire_detection_rate = round((stats["fire_detections"] / stats["total_checks"] * 100), 2)
+            
+            data.append({
+                "camera_name": stats["camera_name"],
+                "camera_id": stats["camera_id"],
+                "location": stats["location"],
+                "area": stats["area"],
+                "building": stats["building"],
+                "zone": stats["zone"],
+                "total_checks": stats["total_checks"],
+                "fire_detections": stats["fire_detections"],
+                "days_with_fire": len(stats["days_with_fire"]),
+                "first_fire_detection": datetime.fromtimestamp(stats["first_fire_detection"], tz=timezone.utc).isoformat() if stats["first_fire_detection"] else None,
+                "last_fire_detection": datetime.fromtimestamp(stats["last_fire_detection"], tz=timezone.utc).isoformat() if stats["last_fire_detection"] else None,
+                "fire_detection_rate": fire_detection_rate
+            })
+        
+        # Sort by fire_detections descending
+        data.sort(key=lambda x: (x["fire_detections"], x["camera_name"]), reverse=True)
+        
+        return {
+            "success": True,
+            "count": len(data),
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching fire detections by camera from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/detections-by-location")
+async def get_fire_detections_by_location(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    group_by: str = Query("location", regex="^(location|area|building|zone|floor_level)$"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get fire detection counts by location grouping from Qdrant
+    
+    Chart: Fire Detections by Location (Bar Chart / Heatmap)
+    Returns: Number of fire detections grouped by location, area, building, zone, or floor
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        filter_obj = _build_date_filter(start_date, end_date, user_system_role, user_workspace_role, username)
+        
+        # Fetch all points
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
+            [group_by, "camera_id", "fire_status", "timestamp"]
+        )
+        
+        # Group statistics
+        location_stats = defaultdict(lambda: {
+            "total_checks": 0,
+            "fire_detections": 0,
+            "cameras_in_group": set(),
+            "days_with_fire": set(),
+            "first_fire_detection": None,
+            "last_fire_detection": None
+        })
+        
+        for point in all_points:
+            if point.payload:
+                group_value = point.payload.get(group_by) or "Unknown"
+                camera_id = point.payload.get("camera_id")
+                fire_status = point.payload.get("fire_status", "no detection")
+                timestamp = point.payload.get("timestamp")
+                
+                stats = location_stats[group_value]
+                stats["total_checks"] += 1
+                
+                if camera_id:
+                    stats["cameras_in_group"].add(camera_id)
+                
+                if fire_status != "no detection":
+                    stats["fire_detections"] += 1
+                    
+                    if timestamp:
+                        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                        stats["days_with_fire"].add(dt.date())
+                        
+                        if stats["first_fire_detection"] is None or timestamp < stats["first_fire_detection"]:
+                            stats["first_fire_detection"] = timestamp
+                        if stats["last_fire_detection"] is None or timestamp > stats["last_fire_detection"]:
+                            stats["last_fire_detection"] = timestamp
+        
+        # Convert to list
+        data = []
+        for group_name, stats in location_stats.items():
+            fire_detection_rate = 0
+            if stats["total_checks"] > 0:
+                fire_detection_rate = round((stats["fire_detections"] / stats["total_checks"] * 100), 2)
+            
+            data.append({
+                "group_name": group_name,
+                "group_type": group_by,
+                "total_checks": stats["total_checks"],
+                "fire_detections": stats["fire_detections"],
+                "cameras_in_group": len(stats["cameras_in_group"]),
+                "days_with_fire": len(stats["days_with_fire"]),
+                "first_fire_detection": datetime.fromtimestamp(stats["first_fire_detection"], tz=timezone.utc).isoformat() if stats["first_fire_detection"] else None,
+                "last_fire_detection": datetime.fromtimestamp(stats["last_fire_detection"], tz=timezone.utc).isoformat() if stats["last_fire_detection"] else None,
+                "fire_detection_rate": fire_detection_rate
+            })
+        
+        # Sort by fire_detections descending
+        data.sort(key=lambda x: x["fire_detections"], reverse=True)
+        
+        return {
+            "success": True,
+            "group_by": group_by,
+            "count": len(data),
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching fire detections by location from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/detections-timeline")
+async def get_fire_detections_timeline(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    interval: str = Query("day", regex="^(hour|day|week|month)$"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get fire detections over time from Qdrant
+    
+    Chart: Fire Detections Timeline (Line Chart / Area Chart)
+    Returns: Fire detection counts aggregated by time interval
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        filter_obj = _build_date_filter(start_date, end_date, user_system_role, user_workspace_role, username)
+        
+        # Fetch all points
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
+            ["timestamp", "fire_status", "camera_id"]
+        )
+        
+        # Group by time period
+        timeline_stats = defaultdict(lambda: {
+            "total_checks": 0,
+            "fire_detections": 0,
+            "cameras_checked": set(),
+            "cameras_with_fire": set()
+        })
+        
+        for point in all_points:
+            if point.payload:
+                timestamp = point.payload.get("timestamp")
+                fire_status = point.payload.get("fire_status", "no detection")
+                camera_id = point.payload.get("camera_id")
+                
+                if timestamp:
+                    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                    
+                    # Truncate based on interval
+                    if interval == "hour":
+                        time_key = dt.replace(minute=0, second=0, microsecond=0)
+                    elif interval == "day":
+                        time_key = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                    elif interval == "week":
+                        # Get start of week (Monday)
+                        days_since_monday = dt.weekday()
+                        time_key = (dt - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    else:  # month
+                        time_key = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                    
+                    stats = timeline_stats[time_key]
+                    stats["total_checks"] += 1
+                    
+                    if camera_id:
+                        stats["cameras_checked"].add(camera_id)
+                    
+                    if fire_status != "no detection":
+                        stats["fire_detections"] += 1
+                        if camera_id:
+                            stats["cameras_with_fire"].add(camera_id)
+        
+        # Convert to list
+        data = []
+        for time_period, stats in timeline_stats.items():
+            fire_detection_rate = 0
+            if stats["total_checks"] > 0:
+                fire_detection_rate = round((stats["fire_detections"] / stats["total_checks"] * 100), 2)
+            
+            data.append({
+                "time_period": time_period.isoformat(),
+                "total_checks": stats["total_checks"],
+                "fire_detections": stats["fire_detections"],
+                "cameras_checked": len(stats["cameras_checked"]),
+                "cameras_with_fire": len(stats["cameras_with_fire"]),
+                "fire_detection_rate": fire_detection_rate
+            })
+        
+        # Sort by time_period descending
+        data.sort(key=lambda x: x["time_period"], reverse=True)
+        
+        return {
+            "success": True,
+            "interval": interval,
+            "count": len(data),
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching fire detections timeline from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/detections-by-weekday")
+async def get_fire_detections_by_weekday(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get fire detection patterns by day of week from Qdrant
+    
+    Chart: Fire Detections by Weekday (Bar Chart)
+    Returns: Fire detection counts for each day of the week
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        filter_obj = _build_date_filter(start_date, end_date, user_system_role, user_workspace_role, username)
+        
+        # Fetch all points
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
+            ["timestamp", "fire_status"]
+        )
+        
+        # Group by weekday
+        weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        weekday_stats = defaultdict(lambda: {
+            "total_checks": 0,
+            "fire_detections": 0,
+            "days_sampled": set()
+        })
+        
+        for point in all_points:
+            if point.payload:
+                timestamp = point.payload.get("timestamp")
+                fire_status = point.payload.get("fire_status", "no detection")
+                
+                if timestamp:
+                    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                    weekday_num = dt.weekday()
+                    weekday_name = weekday_names[weekday_num]
+                    
+                    stats = weekday_stats[weekday_num]
+                    stats["weekday_name"] = weekday_name
+                    stats["total_checks"] += 1
+                    stats["days_sampled"].add(dt.date())
+                    
+                    if fire_status != "no detection":
+                        stats["fire_detections"] += 1
+        
+        # Convert to list
+        data = []
+        for weekday_num, stats in weekday_stats.items():
+            fire_detection_rate = 0
+            if stats["total_checks"] > 0:
+                fire_detection_rate = round((stats["fire_detections"] / stats["total_checks"] * 100), 2)
+            
+            data.append({
+                "weekday_name": stats["weekday_name"],
+                "weekday_num": weekday_num,
+                "total_checks": stats["total_checks"],
+                "fire_detections": stats["fire_detections"],
+                "days_sampled": len(stats["days_sampled"]),
+                "fire_detection_rate": fire_detection_rate
+            })
+        
+        # Sort by weekday_num
+        data.sort(key=lambda x: x["weekday_num"])
+        
+        return {
+            "success": True,
+            "count": len(data),
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching fire detections by weekday from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/detections-by-hour")
+async def get_fire_detections_by_hour(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get fire detection patterns by hour of day from Qdrant
+    
+    Chart: Fire Detections by Hour (Line Chart / Heatmap)
+    Returns: Fire detection counts for each hour of the day
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        filter_obj = _build_date_filter(start_date, end_date, user_system_role, user_workspace_role, username)
+        
+        # Fetch all points
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
+            ["timestamp", "fire_status"]
+        )
+        
+        # Group by hour
+        hour_stats = defaultdict(lambda: {
+            "total_checks": 0,
+            "fire_detections": 0,
+            "days_sampled": set()
+        })
+        
+        for point in all_points:
+            if point.payload:
+                timestamp = point.payload.get("timestamp")
+                fire_status = point.payload.get("fire_status", "no detection")
+                
+                if timestamp:
+                    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                    hour = dt.hour
+                    
+                    stats = hour_stats[hour]
+                    stats["total_checks"] += 1
+                    stats["days_sampled"].add(dt.date())
+                    
+                    if fire_status != "no detection":
+                        stats["fire_detections"] += 1
+        
+        # Convert to list
+        data = []
+        for hour, stats in hour_stats.items():
+            fire_detection_rate = 0
+            avg_detections_per_day = 0
+            
+            if stats["total_checks"] > 0:
+                fire_detection_rate = round((stats["fire_detections"] / stats["total_checks"] * 100), 2)
+            
+            if len(stats["days_sampled"]) > 0:
+                avg_detections_per_day = round(stats["fire_detections"] / len(stats["days_sampled"]), 2)
+            
+            data.append({
+                "hour": hour,
+                "total_checks": stats["total_checks"],
+                "fire_detections": stats["fire_detections"],
+                "days_sampled": len(stats["days_sampled"]),
+                "fire_detection_rate": fire_detection_rate,
+                "avg_detections_per_day": avg_detections_per_day
+            })
+        
+        # Sort by hour
+        data.sort(key=lambda x: x["hour"])
+        
+        return {
+            "success": True,
+            "count": len(data),
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching fire detections by hour from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/recent-detections")
+async def get_recent_fire_detections(
+    request: Request,
+    limit: int = Query(50, le=500, description="Max number of recent detections"),
+    camera_id: Optional[UUID] = None,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get most recent fire detections from Qdrant
+    
+    Chart: Recent Fire Detection Events (Table / Timeline)
+    Returns: List of recent fire detection events with details
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        must_conditions = []
+        
+        # User access control
+        if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if username:
+                must_conditions.append(
+                    qdrant_models.FieldCondition(
+                        key="username",
+                        match=qdrant_models.MatchValue(value=username)
+                    )
+                )
+        
+        # Camera ID filter
+        if camera_id:
+            must_conditions.append(
+                qdrant_models.FieldCondition(
+                    key="camera_id",
+                    match=qdrant_models.MatchValue(value=str(camera_id))
+                )
+            )
+        
+        # Fire status filter (only fire detections)
+        must_conditions.append(
+            qdrant_models.FieldCondition(
+                key="fire_status",
+                match=qdrant_models.MatchExcept(**{"except": ["no detection"]})
+            )
+        )
+        
+        filter_obj = qdrant_models.Filter(must=must_conditions) if must_conditions else None
+        
+        # Fetch points with ordering by timestamp
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=filter_obj,
+            limit=limit,
+            with_payload=["camera_id", "name", "timestamp", "fire_status", "person_count",
+                         "location", "area", "building", "zone", "floor_level"],
+            with_vectors=False,
+            order_by=qdrant_models.OrderBy(
+                key="timestamp",
+                direction=qdrant_models.Direction.DESC
+            )
+        )
+        
+        # Convert to list
+        data = []
+        for point in points:
+            if point.payload:
+                timestamp = point.payload.get("timestamp")
+                data.append({
+                    "result_id": str(point.id),
+                    "camera_id": point.payload.get("camera_id"),
+                    "camera_name": point.payload.get("name", "Unknown Camera"),
+                    "timestamp": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat() if timestamp else None,
+                    "fire_status": point.payload.get("fire_status"),
+                    "person_count": point.payload.get("person_count", 0),
+                    "location": point.payload.get("location"),
+                    "area": point.payload.get("area"),
+                    "building": point.payload.get("building"),
+                    "zone": point.payload.get("zone"),
+                    "floor_level": point.payload.get("floor_level")
+                })
+        
+        return {
+            "success": True,
+            "limit": limit,
+            "count": len(data),
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching recent fire detections from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/high-risk-cameras")
+async def get_high_risk_cameras(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    threshold_percentage: float = Query(5.0, ge=0, le=100, description="Min fire detection rate to be considered high risk"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get cameras with high fire detection rates from Qdrant
+    
+    Chart: High Risk Cameras (Table / Alert List)
+    Returns: Cameras with fire detection rate above threshold
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    user_system_role = current_user_data.get("system_role", "user")
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        workspace_role_info = await check_workspace_access(
+            db_manager,
+            user_id_obj,
+            workspace_id_obj,
+            required_role=None,
+        )
+        user_workspace_role = workspace_role_info.get("role")
+        
+        # Get Qdrant collection
+        collection_name = get_workspace_qdrant_collection_name(workspace_id_obj)
+        client = qdrant_service.get_client()
+        await ensure_workspace_qdrant_collection_exists(client, workspace_id_obj)
+        
+        # Build filter
+        filter_obj = _build_date_filter(start_date, end_date, user_system_role, user_workspace_role, username)
+        
+        # Fetch all points
+        all_points = await _fetch_all_qdrant_points(
+            collection_name,
+            filter_obj,
+            ["camera_id", "name", "location", "area", "building", "zone", "floor_level", "fire_status", "timestamp"]
+        )
+        
+        # Calculate statistics per camera
+        camera_stats = defaultdict(lambda: {
+            "camera_name": None,
+            "camera_id": None,
+            "location": None,
+            "area": None,
+            "building": None,
+            "zone": None,
+            "floor_level": None,
+            "total_checks": 0,
+            "fire_detections": 0,
+            "first_fire_detection": None,
+            "last_fire_detection": None,
+            "days_with_fire": set()
+        })
+        
+        for point in all_points:
+            if point.payload:
+                camera_id = point.payload.get("camera_id")
+                fire_status = point.payload.get("fire_status", "no detection")
+                timestamp = point.payload.get("timestamp")
+                
+                if camera_id:
+                    stats = camera_stats[camera_id]
+                    stats["camera_id"] = camera_id
+                    stats["camera_name"] = point.payload.get("name", "Unknown Camera")
+                    stats["location"] = point.payload.get("location")
+                    stats["area"] = point.payload.get("area")
+                    stats["building"] = point.payload.get("building")
+                    stats["zone"] = point.payload.get("zone")
+                    stats["floor_level"] = point.payload.get("floor_level")
+                    stats["total_checks"] += 1
+                    
+                    if fire_status != "no detection":
+                        stats["fire_detections"] += 1
+                        
+                        if timestamp:
+                            dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                            stats["days_with_fire"].add(dt.date())
+                            
+                            if stats["first_fire_detection"] is None or timestamp < stats["first_fire_detection"]:
+                                stats["first_fire_detection"] = timestamp
+                            if stats["last_fire_detection"] is None or timestamp > stats["last_fire_detection"]:
+                                stats["last_fire_detection"] = timestamp
+        
+        # Filter cameras above threshold and convert to list
+        data = []
+        for stats in camera_stats.values():
+            fire_detection_rate = 0
+            if stats["total_checks"] > 0:
+                fire_detection_rate = round((stats["fire_detections"] / stats["total_checks"] * 100), 2)
+            
+            # Only include if above threshold
+            if fire_detection_rate >= threshold_percentage:
+                data.append({
+                    "camera_name": stats["camera_name"],
+                    "camera_id": stats["camera_id"],
+                    "location": stats["location"],
+                    "area": stats["area"],
+                    "building": stats["building"],
+                    "zone": stats["zone"],
+                    "floor_level": stats["floor_level"],
+                    "total_checks": stats["total_checks"],
+                    "fire_detections": stats["fire_detections"],
+                    "fire_detection_rate": fire_detection_rate,
+                    "first_fire_detection": datetime.fromtimestamp(stats["first_fire_detection"], tz=timezone.utc).isoformat() if stats["first_fire_detection"] else None,
+                    "last_fire_detection": datetime.fromtimestamp(stats["last_fire_detection"], tz=timezone.utc).isoformat() if stats["last_fire_detection"] else None,
+                    "days_with_fire": len(stats["days_with_fire"])
+                })
+        
+        # Sort by fire_detection_rate descending
+        data.sort(key=lambda x: (x["fire_detection_rate"], x["fire_detections"]), reverse=True)
+        
+        return {
+            "success": True,
+            "threshold_percentage": threshold_percentage,
+            "high_risk_count": len(data),
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching high risk cameras from Qdrant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+   

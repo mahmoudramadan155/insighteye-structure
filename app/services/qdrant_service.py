@@ -69,8 +69,9 @@ class QdrantService:
         fire_status: str, 
         frame: np.ndarray, 
         workspace_id: UUID,
-        location_info: Optional[Dict[str, Any]] = None
-    ) -> bool:
+        location_info: Optional[Dict[str, Any]] = None,
+        result_id: Optional[UUID] = None
+    ) -> bool: #Tuple[bool, Optional[str]]:
         """
         Insert detection data with location information into Qdrant.
         Moved from stream_service.py
@@ -86,10 +87,11 @@ class QdrantService:
             await ensure_workspace_qdrant_collection_exists(client, workspace_id)
             
             now_utc = datetime.now(timezone.utc)
-            point_id_str = str(uuid4())
+            point_id_str = str(result_id) if result_id else str(uuid4())
             
             # Base payload
             payload = {
+                "result_id": point_id_str,
                 "camera_id": camera_id_str,
                 "name": camera_name,
                 "timestamp": now_utc.timestamp(),

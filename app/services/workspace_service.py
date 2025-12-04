@@ -47,6 +47,61 @@ class WorkspaceService:
             "is_active": workspace_row["is_active"]
         }
 
+    async def get_workspaces_by_user_id(
+        self,
+        user_id: UUID,
+        include_inactive: bool = False
+    ) -> List[dict]:
+        """
+        Get all workspaces for a specific user by their user_id.
+        
+        Args:
+            user_id: The UUID of the user
+            include_inactive: Whether to include inactive workspaces
+            
+        Returns:
+            List of workspace dictionaries with membership information
+        """
+        query = """
+            SELECT w.workspace_id, w.name, w.description, w.created_at, w.updated_at, 
+                w.is_active, wm.role as member_role, wm.created_at as joined_at
+            FROM workspaces w
+            JOIN workspace_members wm ON w.workspace_id = wm.workspace_id
+            WHERE wm.user_id = $1
+        """
+        params_list = [user_id]
+        
+        if not include_inactive:
+            query += " AND w.is_active = TRUE"
+        
+        query += " ORDER BY w.created_at DESC"
+        
+        try:
+            workspaces_rows = await self.db_manager.execute_query(
+                query, 
+                tuple(params_list), 
+                fetch_all=True
+            )
+            
+            return [
+                {
+                    "workspace_id": str(w_row["workspace_id"]),
+                    "name": w_row["name"],
+                    "description": w_row["description"],
+                    "created_at": w_row["created_at"].isoformat() if w_row["created_at"] else None,
+                    "updated_at": w_row["updated_at"].isoformat() if w_row["updated_at"] else None,
+                    "is_active": w_row["is_active"],
+                    "member_role": w_row["member_role"]
+                } for w_row in workspaces_rows
+            ] if workspaces_rows else []
+            
+        except Exception as e:
+            logger.error(f"Error retrieving workspaces for user_id {user_id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to retrieve workspaces for user."
+            )
+
     async def get_workspace_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         """Retrieve workspace by name."""
         query = "SELECT * FROM workspaces WHERE name = $1 AND is_active = TRUE"
@@ -921,5 +976,82 @@ class WorkspaceService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to retrieve all workspaces."
             )
-
+    
+    async def get_workspace_statistics(
+        self,
+        workspace_id: Union[str, UUID]
+    ) -> Dict[str, Any]:
+        """Get comprehensive statistics for a workspace"""
+        workspace_id_obj = workspace_id if isinstance(workspace_id, UUID) else UUID(str(workspace_id))
+        
+        stats = {
+            'workspace_id': str(workspace_id_obj),
+            'members': {'total': 0, 'by_role': {}},
+            'streams': {'total': 0, 'active': 0, 'streaming': 0, 'by_status': {}},
+            'notifications': {'total': 0, 'unread': 0},
+            'recent_activity': []
+        }
+        
+        # Member counts
+        member_query = """
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE role = 'owner') as owners,
+                   COUNT(*) FILTER (WHERE role = 'admin') as admins,
+                   COUNT(*) FILTER (WHERE role = 'member') as members
+            FROM workspace_members
+            WHERE workspace_id = $1
+        """
+        member_stats = await self.db_manager.execute_query(
+            member_query, (workspace_id_obj,), fetch_one=True
+        )
+        
+        if member_stats:
+            stats['members']['total'] = member_stats['total']
+            stats['members']['by_role'] = {
+                'owner': member_stats['owners'],
+                'admin': member_stats['admins'],
+                'member': member_stats['members']
+            }
+        
+        # Stream counts
+        stream_query = """
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE status = 'active') as active,
+                   COUNT(*) FILTER (WHERE is_streaming = TRUE) as streaming,
+                   COUNT(*) FILTER (WHERE status = 'inactive') as inactive,
+                   COUNT(*) FILTER (WHERE status = 'error') as error
+            FROM video_stream
+            WHERE workspace_id = $1
+        """
+        stream_stats = await self.db_manager.execute_query(
+            stream_query, (workspace_id_obj,), fetch_one=True
+        )
+        
+        if stream_stats:
+            stats['streams']['total'] = stream_stats['total']
+            stats['streams']['active'] = stream_stats['active']
+            stats['streams']['streaming'] = stream_stats['streaming']
+            stats['streams']['by_status'] = {
+                'active': stream_stats['active'],
+                'inactive': stream_stats['inactive'],
+                'error': stream_stats['error']
+            }
+        
+        # Notification counts
+        notif_query = """
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE is_read = FALSE) as unread
+            FROM notifications
+            WHERE workspace_id = $1
+        """
+        notif_stats = await self.db_manager.execute_query(
+            notif_query, (workspace_id_obj,), fetch_one=True
+        )
+        
+        if notif_stats:
+            stats['notifications']['total'] = notif_stats['total']
+            stats['notifications']['unread'] = notif_stats['unread']
+        
+        return stats
+    
 workspace_service = WorkspaceService()

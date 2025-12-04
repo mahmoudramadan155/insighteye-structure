@@ -1,5 +1,5 @@
 # app/services/camera_service.py
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Union
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 import logging
@@ -787,4 +787,389 @@ class CameraService:
         
         return {"streams": formatted_streams, "total": len(formatted_streams)}
 
+    async def search_cameras_by_filters(
+        self,
+        user_id: UUID,
+        workspace_id: Optional[UUID] = None,
+        q: Optional[str] = None,
+        location_type: Optional[List[str]] = None,
+        locations: Optional[List[str]] = None,
+        areas: Optional[List[str]] = None,
+        buildings: Optional[List[str]] = None,
+        floor_levels: Optional[List[str]] = None,
+        zones: Optional[List[str]] = None,
+        encoded_string: str = ""
+    ) -> List[Dict[str, Any]]:
+        """
+        Search cameras using location-based filters and text search.
+        
+        Args:
+            user_id: The user performing the search
+            workspace_id: Optional workspace to filter by
+            q: Text search query
+            location_type: Filter by location type(s)
+            locations: Filter by specific location(s)
+            areas: Filter by specific area(s)
+            buildings: Filter by specific building(s)
+            floor_levels: Filter by specific floor level(s)
+            zones: Filter by specific zone(s)
+            encoded_string: Base64 encoded string for static_base64 field
+            
+        Returns:
+            List of camera dictionaries matching the filters
+        """
+        try:
+            # Base query matching /source/user structure
+            base_query = """
+                SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, 
+                    vs.type, vs.status, vs.is_streaming, vs.created_at, vs.updated_at,
+                    vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
+                    vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
+                    w.name as workspace_name, vs.workspace_id
+                FROM video_stream vs
+                JOIN users u ON vs.user_id = u.user_id
+                LEFT JOIN workspaces w ON vs.workspace_id = w.workspace_id
+                JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
+                WHERE wm.user_id = $1
+            """
+            
+            params = [user_id]
+            param_count = 1
+            
+            # Filter by workspace if provided
+            if workspace_id:
+                param_count += 1
+                base_query += f" AND vs.workspace_id = ${param_count}"
+                params.append(workspace_id)
+            
+            # Handle text search with special case for location_type + comma-separated values
+            if q:
+                q_values = [v.strip() for v in q.split(',')] if ',' in q else [q]
+                
+                # Special handling: single location_type with multiple comma-separated values
+                if location_type and len(location_type) == 1 and len(q_values) > 1:
+                    location_field_map = {
+                        "area": "vs.area", "areas": "vs.area",
+                        "building": "vs.building", "buildings": "vs.building",
+                        "floor_level": "vs.floor_level", "floor_levels": "vs.floor_level",
+                        "zone": "vs.zone", "zones": "vs.zone",
+                        "location": "vs.location", "locations": "vs.location"
+                    }
+                    
+                    field_name = location_field_map.get(location_type[0])
+                    if field_name:
+                        # Use exact match for specific values
+                        param_count += 1
+                        q_placeholders = ", ".join([f"${param_count + i}" for i in range(len(q_values))])
+                        base_query += f" AND {field_name} IN ({q_placeholders})"
+                        params.extend(q_values)
+                        param_count += len(q_values) - 1
+                    else:
+                        # Fallback to general text search
+                        param_count += 1
+                        base_query += f"""
+                            AND (
+                                vs.name ILIKE ${param_count} OR 
+                                vs.building ILIKE ${param_count} OR 
+                                vs.floor_level ILIKE ${param_count} OR 
+                                vs.zone ILIKE ${param_count} OR 
+                                vs.area ILIKE ${param_count} OR 
+                                vs.location ILIKE ${param_count}
+                            )
+                        """
+                        params.append(f"%{q}%")
+                else:
+                    # Regular text search
+                    param_count += 1
+                    base_query += f"""
+                        AND (
+                            vs.name ILIKE ${param_count} OR 
+                            vs.building ILIKE ${param_count} OR 
+                            vs.floor_level ILIKE ${param_count} OR 
+                            vs.zone ILIKE ${param_count} OR 
+                            vs.area ILIKE ${param_count} OR 
+                            vs.location ILIKE ${param_count}
+                        )
+                    """
+                    params.append(f"%{q}%")
+            
+            # Add location type filter (supports multiple types)
+            if location_type:
+                type_conditions = []
+                for loc_type in location_type:
+                    if loc_type in ["building", "buildings"]:
+                        type_conditions.append("(vs.building IS NOT NULL AND vs.building != '')")
+                    elif loc_type in ["floor_level", "floor_levels"]:
+                        type_conditions.append("(vs.floor_level IS NOT NULL AND vs.floor_level != '')")
+                    elif loc_type in ["zone", "zones"]:
+                        type_conditions.append("(vs.zone IS NOT NULL AND vs.zone != '')")
+                    elif loc_type in ["area", "areas"]:
+                        type_conditions.append("(vs.area IS NOT NULL AND vs.area != '')")
+                    elif loc_type in ["location", "locations"]:
+                        type_conditions.append("(vs.location IS NOT NULL AND vs.location != '')")
+                
+                if type_conditions:
+                    base_query += f" AND ({' OR '.join(type_conditions)})"
+            
+            # Add specific location filters
+            filter_configs = [
+                (locations, "vs.location"),
+                (areas, "vs.area"),
+                (buildings, "vs.building"),
+                (floor_levels, "vs.floor_level"),
+                (zones, "vs.zone")
+            ]
+            
+            for filter_values, column_name in filter_configs:
+                if filter_values:
+                    param_count += 1
+                    placeholders = ", ".join([f"${param_count + i}" for i in range(len(filter_values))])
+                    base_query += f" AND {column_name} IN ({placeholders})"
+                    params.extend(filter_values)
+                    param_count += len(filter_values) - 1
+            
+            base_query += " ORDER BY u.username, vs.created_at DESC"
+            
+            # Execute query
+            results = await self.db_manager.execute_query(base_query, tuple(params), fetch_all=True)
+            results = results or []
+            
+            # Format results to match /source/user response structure
+            return [
+                {
+                    "id": str(r["stream_id"]),
+                    "user_id": str(r["user_id"]),
+                    "owner_username": r["owner_username"],
+                    "name": r["name"],
+                    "path": r["path"],
+                    "type": r["type"],
+                    "status": r["status"],
+                    "is_streaming": r["is_streaming"],
+                    "location": r["location"],
+                    "area": r["area"],
+                    "building": r["building"],
+                    "floor_level": r["floor_level"],
+                    "zone": r["zone"],
+                    "latitude": float(r["latitude"]) if r["latitude"] else None,
+                    "longitude": float(r["longitude"]) if r["longitude"] else None,
+                    "count_threshold_greater": r["count_threshold_greater"],
+                    "count_threshold_less": r["count_threshold_less"],
+                    "alert_enabled": r["alert_enabled"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                    "workspace_id": str(r["workspace_id"]) if r["workspace_id"] else None,
+                    "workspace_name": r["workspace_name"],
+                    "static_base64": encoded_string
+                } for r in results
+            ]
+            
+        except asyncpg.PostgresError as db_err:
+            logger.error(f"Database error searching cameras: {db_err}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Database error occurred while searching cameras.")
+        except Exception as e:
+            logger.error(f"Error searching cameras by filters: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="An unexpected error occurred while searching cameras.")
+
+    async def create_stream(
+        self,
+        workspace_id: Union[str, UUID],
+        user_id: Union[str, UUID],
+        name: str,
+        path: str,
+        stream_type: str = 'rtsp',
+        location_info: Optional[Dict[str, Any]] = None
+    ) -> UUID:
+        """Create a new video stream"""
+        workspace_id_obj = workspace_id if isinstance(workspace_id, UUID) else UUID(str(workspace_id))
+        user_id_obj = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
+        stream_id = uuid4()
+        now = datetime.now(timezone.utc)
+        
+        query = """
+            INSERT INTO video_stream
+            (stream_id, workspace_id, user_id, name, path, type, status, is_streaming,
+             location, area, building, zone, floor_level, latitude, longitude,
+             created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        """
+        
+        location = location_info.get('location') if location_info else None
+        area = location_info.get('area') if location_info else None
+        building = location_info.get('building') if location_info else None
+        zone = location_info.get('zone') if location_info else None
+        floor_level = location_info.get('floor_level') if location_info else None
+        latitude = float(location_info['latitude']) if location_info and location_info.get('latitude') else None
+        longitude = float(location_info['longitude']) if location_info and location_info.get('longitude') else None
+        
+        await self.db_manager.execute_query(
+            query,
+            (stream_id, workspace_id_obj, user_id_obj, name, path, stream_type, 
+             'inactive', False, location, area, building, zone, floor_level,
+             latitude, longitude, now, now)
+        )
+        
+        return stream_id
+    
+    async def update_stream(
+        self,
+        stream_id: Union[str, UUID],
+        updates: StreamUpdate
+    ) -> bool:
+        """Update stream properties"""
+        stream_id_obj = stream_id if isinstance(stream_id, UUID) else UUID(str(stream_id))
+        
+        # Build dynamic update query
+        update_fields = []
+        params = []
+        param_count = 1
+        
+        update_dict = updates.model_dump(exclude_none=True)
+        
+        for field, value in update_dict.items():
+            if field in ['latitude', 'longitude'] and value is not None:
+                value = float(value)
+            update_fields.append(f"{field} = ${param_count}")
+            params.append(value)
+            param_count += 1
+        
+        if not update_fields:
+            return False
+        
+        # Always update updated_at
+        update_fields.append(f"updated_at = ${param_count}")
+        params.append(datetime.now(timezone.utc))
+        param_count += 1
+        
+        params.append(stream_id_obj)
+        
+        query = f"""
+            UPDATE video_stream
+            SET {', '.join(update_fields)}
+            WHERE stream_id = ${param_count}
+        """
+        
+        rows_affected = await self.db_manager.execute_query(
+            query, tuple(params), return_rowcount=True
+        )
+        return rows_affected > 0
+    
+    async def update_stream_status(
+        self,
+        stream_id: Union[str, UUID],
+        status: str,
+        is_streaming: Optional[bool] = None
+    ) -> bool:
+        """Update stream status and streaming state"""
+        valid_statuses = ['active', 'inactive', 'error', 'pending']
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid status. Must be one of: {valid_statuses}")
+        
+        stream_id_obj = stream_id if isinstance(stream_id, UUID) else UUID(str(stream_id))
+        
+        if is_streaming is not None:
+            query = """
+                UPDATE video_stream
+                SET status = $1, is_streaming = $2, updated_at = $3
+                WHERE stream_id = $4
+            """
+            params = (status, is_streaming, datetime.now(timezone.utc), stream_id_obj)
+        else:
+            query = """
+                UPDATE video_stream
+                SET status = $1, updated_at = $2
+                WHERE stream_id = $3
+            """
+            params = (status, datetime.now(timezone.utc), stream_id_obj)
+        
+        rows_affected = await self.db_manager.execute_query(
+            query, params, return_rowcount=True
+        )
+        return rows_affected > 0
+    
+    async def delete_stream(self, stream_id: Union[str, UUID]) -> bool:
+        """Delete a video stream"""
+        query = "DELETE FROM video_stream WHERE stream_id = $1"
+        stream_id_obj = stream_id if isinstance(stream_id, UUID) else UUID(str(stream_id))
+        
+        rows_affected = await self.db_manager.execute_query(
+            query, (stream_id_obj,), return_rowcount=True
+        )
+        return rows_affected > 0
+    
+    async def get_user_stream_count(self, user_id: Union[str, UUID]) -> int:
+        """Get count of streams owned by user"""
+        query = "SELECT COUNT(*) as count FROM video_stream WHERE user_id = $1"
+        user_id_obj = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
+        
+        result = await self.db_manager.execute_query(
+            query, (user_id_obj,), fetch_one=True
+        )
+        return result['count'] if result else 0
+    
+    async def create_param_stream(
+        self,
+        workspace_id: Union[str, UUID],
+        user_id: Union[str, UUID],
+        parameters: Dict[str, Any]
+    ) -> UUID:
+        """Create a parameter stream entry"""
+        import json
+        
+        param_id = uuid4()
+        workspace_id_obj = workspace_id if isinstance(workspace_id, UUID) else UUID(str(workspace_id))
+        user_id_obj = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
+        now = datetime.now(timezone.utc)
+        
+        query = """
+            INSERT INTO param_stream
+            (param_id, workspace_id, user_id, parameters, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """
+        
+        await self.db_manager.execute_query(
+            query,
+            (param_id, workspace_id_obj, user_id_obj, json.dumps(parameters), now, now)
+        )
+        
+        return param_id
+    
+    async def get_param_stream(
+        self,
+        workspace_id: Union[str, UUID]
+    ) -> Optional[Dict]:
+        """Get parameter stream for workspace"""
+        query = """
+            SELECT param_id, workspace_id, user_id, parameters, created_at, updated_at
+            FROM param_stream
+            WHERE workspace_id = $1
+        """
+        workspace_id_obj = workspace_id if isinstance(workspace_id, UUID) else UUID(str(workspace_id))
+        
+        result = await self.db_manager.execute_query(
+            query, (workspace_id_obj,), fetch_one=True
+        )
+        return dict(result) if result else None
+    
+    async def update_param_stream(
+        self,
+        workspace_id: Union[str, UUID],
+        parameters: Dict[str, Any]
+    ) -> bool:
+        """Update parameter stream"""
+        import json
+        
+        query = """
+            UPDATE param_stream
+            SET parameters = $1, updated_at = $2
+            WHERE workspace_id = $3
+        """
+        workspace_id_obj = workspace_id if isinstance(workspace_id, UUID) else UUID(str(workspace_id))
+        
+        rows_affected = await self.db_manager.execute_query(
+            query,
+            (json.dumps(parameters), datetime.now(timezone.utc), workspace_id_obj),
+            return_rowcount=True
+        )
+        return rows_affected > 0
+                
 camera_service = CameraService()

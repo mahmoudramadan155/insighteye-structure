@@ -1,6 +1,6 @@
 # app/services/fire_detection_service.py
 import logging
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Union
 from uuid import UUID
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -110,6 +110,41 @@ class FireDetectionService:
         
         return rows > 0
 
+    async def upsert_fire_detection_state(
+        self,
+        stream_id: Union[str, UUID],
+        fire_status: str,
+        last_detection_time: Optional[datetime] = None,
+        last_notification_time: Optional[datetime] = None
+    ) -> bool:
+        """Create or update fire detection state"""
+        stream_id_obj = stream_id if isinstance(stream_id, UUID) else UUID(str(stream_id))
+        now = datetime.now(timezone.utc)
+        detection_time = last_detection_time or now
+        
+        query = """
+            INSERT INTO fire_detection_state
+            (stream_id, fire_status, last_detection_time, last_notification_time, 
+             created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (stream_id) DO UPDATE SET
+                fire_status = EXCLUDED.fire_status,
+                last_detection_time = EXCLUDED.last_detection_time,
+                last_notification_time = CASE 
+                    WHEN EXCLUDED.last_notification_time IS NOT NULL 
+                    THEN EXCLUDED.last_notification_time 
+                    ELSE fire_detection_state.last_notification_time 
+                END,
+                updated_at = EXCLUDED.updated_at
+        """
+        
+        rows_affected = await self.db_manager.execute_query(
+            query,
+            (stream_id_obj, fire_status, detection_time, last_notification_time, now, now),
+            return_rowcount=True
+        )
+        return rows_affected > 0
+    
     async def clear_fire_detection_state(self, stream_id: UUID) -> Optional[Dict[str, Any]]:
         """Clear/reset fire detection state to 'no detection'."""
         query = """

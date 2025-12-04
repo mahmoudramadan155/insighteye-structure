@@ -714,6 +714,18 @@ class UserManager:
             await self._log_security_event(user_id=user_id, event_type="user_role_changed", severity="high", event_data={"username": username, "new_role": role})
         return bool(rows_affected is not None and rows_affected > 0)
     
+    async def update_last_login(self, user_id: Union[str, UUID]) -> bool:
+        """Update user's last login timestamp"""
+        query = "UPDATE users SET last_login = $1 WHERE user_id = $2"
+        user_id_obj = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
+        
+        rows_affected = await self.db_manager.execute_query(
+            query, 
+            (datetime.now(timezone.utc), user_id_obj), 
+            return_rowcount=True
+        )
+        return rows_affected > 0
+        
     async def update_camera_count(self, username: str, count: int) -> bool:
         if count < 0:
             logger.warning(f"Invalid camera count attempted: {count}")
@@ -738,7 +750,37 @@ class UserManager:
         """
         users_data = await self.db_manager.execute_query(query, fetch_all=True)
         return [dict(user) for user in users_data] if users_data else [] 
+
+
+    async def get_all_users_with_conditions(
+        self, 
+        include_inactive: bool = True,
+        role_filter: Optional[str] = None
+    ) -> List[Dict]:
+        """Get all users with optional filters"""
+        conditions = []
+        params = []
         
+        if not include_inactive:
+            conditions.append("is_active = TRUE")
+        
+        if role_filter:
+            conditions.append(f"role = ${len(params) + 1}")
+            params.append(role_filter)
+        
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        
+        query = f"""
+            SELECT user_id, username, email, created_at, is_active, last_login, role, 
+                   is_subscribed, subscription_date, count_of_camera, is_search, is_prediction
+            FROM users
+            {where_clause}
+            ORDER BY created_at DESC
+        """
+        
+        users = await self.db_manager.execute_query(query, tuple(params), fetch_all=True)
+        return [dict(user) for user in users] if users else []
+
     async def get_subscribed_users(self) -> List[Dict]:
         query = """
             SELECT user_id, username, email, created_at, is_active, last_login, 
@@ -924,5 +966,85 @@ class UserManager:
                 status_code=500, 
                 detail="Failed to create user and workspace."
             )
+
+    async def get_user_statistics(
+        self,
+        user_id: Union[str, UUID]
+    ) -> Dict[str, Any]:
+        """Get comprehensive statistics for a user"""
+        user_id_obj = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
+        
+        stats = {
+            'user_id': str(user_id_obj),
+            'workspaces': {'total': 0, 'by_role': {}},
+            'streams': {'total': 0, 'active': 0, 'streaming': 0},
+            'notifications': {'total': 0, 'unread': 0},
+            'sessions': {'active': 0}
+        }
+        
+        # Workspace counts
+        ws_query = """
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE role = 'owner') as owner,
+                   COUNT(*) FILTER (WHERE role = 'admin') as admin,
+                   COUNT(*) FILTER (WHERE role = 'member') as member
+            FROM workspace_members
+            WHERE user_id = $1
+        """
+        ws_stats = await self.db_manager.execute_query(
+            ws_query, (user_id_obj,), fetch_one=True
+        )
+        
+        if ws_stats:
+            stats['workspaces']['total'] = ws_stats['total']
+            stats['workspaces']['by_role'] = {
+                'owner': ws_stats['owner'],
+                'admin': ws_stats['admin'],
+                'member': ws_stats['member']
+            }
+        
+        # Stream counts
+        stream_query = """
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE status = 'active') as active,
+                   COUNT(*) FILTER (WHERE is_streaming = TRUE) as streaming
+            FROM video_stream
+            WHERE user_id = $1
+        """
+        stream_stats = await self.db_manager.execute_query(
+            stream_query, (user_id_obj,), fetch_one=True
+        )
+        
+        if stream_stats:
+            stats['streams'] = dict(stream_stats)
+        
+        # Notification counts
+        notif_query = """
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE is_read = FALSE) as unread
+            FROM notifications
+            WHERE user_id = $1
+        """
+        notif_stats = await self.db_manager.execute_query(
+            notif_query, (user_id_obj,), fetch_one=True
+        )
+        
+        if notif_stats:
+            stats['notifications'] = dict(notif_stats)
+        
+        # Active sessions
+        session_query = """
+            SELECT COUNT(*) as active
+            FROM sessions
+            WHERE user_id = $1 AND expires_at > $2
+        """
+        session_stats = await self.db_manager.execute_query(
+            session_query, (user_id_obj, datetime.now(timezone.utc)), fetch_one=True
+        )
+        
+        if session_stats:
+            stats['sessions']['active'] = session_stats['active']
+        
+        return stats
         
 user_manager = UserManager()

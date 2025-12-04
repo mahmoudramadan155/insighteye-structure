@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime
+from uuid import UUID
 
 class StreamQueryParams(BaseModel):
     frame_delay: Optional[float] = 0
@@ -171,3 +172,37 @@ class CameraBulkUploadResult(BaseModel):
     successful_cameras: List[Dict[str, Any]]
     failed_cameras: List[Dict[str, Any]]
     errors: List[str]
+
+class UserCameraCountUpdate(BaseModel):
+    """Schema for updating user camera count limit"""
+    user_id: str = Field(..., description="User ID to update")
+    count_of_camera: int = Field(..., ge=0, le=1000, description="New camera count limit (0-1000)")
+    
+    @validator('count_of_camera')
+    def validate_camera_count(cls, v):
+        if v < 0:
+            raise ValueError('Camera count cannot be negative')
+        if v > 1000:
+            raise ValueError('Camera count cannot exceed 1000')
+        return v
+
+
+class UserCameraCountResponse(BaseModel):
+    """Schema for camera count update response"""
+    user_id: str
+    username: str
+    count_of_camera: int
+    previous_count: int
+    message: str
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": "123e4567-e89b-12d3-a456-426614174000",
+                "username": "john_doe",
+                "count_of_camera": 10,
+                "previous_count": 5,
+                "message": "Camera limit updated successfully from 5 to 10"
+            }
+        }
+        
