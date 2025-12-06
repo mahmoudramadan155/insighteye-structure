@@ -1307,7 +1307,7 @@ async def batch_update_metadata_for_cameras(
 
 # ========== Location Data Endpoints ==========
 
-@router.get("/qdrant/locations/list")
+@router.get("/locations/list")
 async def get_qdrant_locations(
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1367,7 +1367,7 @@ async def get_qdrant_locations(
             detail="Failed to retrieve locations."
         )
 
-@router.get("/qdrant/areas/list")
+@router.get("/areas/list")
 async def get_qdrant_areas(
     locations: Optional[str] = Query(None, description="Filter by location(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1438,7 +1438,7 @@ async def get_qdrant_areas(
             detail="Failed to retrieve areas."
         )
 
-@router.get("/qdrant/buildings/list")
+@router.get("/buildings/list")
 async def get_qdrant_buildings(
     areas: Optional[str] = Query(None, description="Filter by area(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1510,7 +1510,7 @@ async def get_qdrant_buildings(
             detail="Failed to retrieve buildings."
         )
 
-@router.get("/qdrant/floor-levels/list")
+@router.get("/floor-levels/list")
 async def get_qdrant_floor_levels(
     buildings: Optional[str] = Query(None, description="Filter by building(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1588,7 +1588,7 @@ async def get_qdrant_floor_levels(
             detail="Failed to retrieve floor levels."
         )
 
-@router.get("/qdrant/zones/list")
+@router.get("/zones/list")
 async def get_qdrant_zones(
     floor_levels: Optional[str] = Query(None, description="Filter by floor level(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1668,7 +1668,7 @@ async def get_qdrant_zones(
             detail="Failed to retrieve zones."
         )
 
-@router.get("/qdrant/locations/analytics")
+@router.get("/locations/analytics")
 async def get_location_analytics(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
@@ -1728,7 +1728,7 @@ async def get_location_analytics(
             detail="Failed to retrieve location analytics."
         )
 
-@router.get("/qdrant/locations/summary")
+@router.get("/locations/summary")
 async def get_location_summary(
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1778,7 +1778,7 @@ async def get_location_summary(
             detail="Failed to retrieve location summary."
         )
 
-@router.get("/qdrant/locations/search")
+@router.get("/locations/search")
 async def search_location_data(
     search_term: str = Query(..., min_length=1, description="Search term"),
     search_fields: List[str] = Query(

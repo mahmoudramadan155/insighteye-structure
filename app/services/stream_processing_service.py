@@ -20,7 +20,8 @@ from app.utils import send_people_count_alert_email, send_fire_alert_email
 from app.services.database import db_manager
 from app.services.user_service import user_manager
 from app.services.postgres_service import postgres_service
-
+from app.services.detection_data_service import detection_data_service
+from app.services.video_stream_service import video_stream_service
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,6 @@ logger = logging.getLogger(__name__)
 thread_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=min(32, (os.cpu_count() or 1) * 2 + 4)
 )
-
 
 class StreamProcessingService:
     """
@@ -38,6 +38,8 @@ class StreamProcessingService:
     def __init__(self):
         self.db_manager = db_manager
         self.postgres_service  = postgres_service 
+        self.detection_data_service  = detection_data_service 
+        self.video_stream_service  = video_stream_service 
         self.people_model = None
         self.gender_model = None
         self.fire_model = None
@@ -275,6 +277,61 @@ class StreamProcessingService:
             return False
 
     async def _save_detection(
+        self,
+        stream_id_str: str,
+        camera_name: str,
+        owner_username: str,
+        person_count: int,
+        male_count: int,
+        female_count: int,
+        fire_status: str,
+        frame: np.ndarray,
+        workspace_id: UUID,
+        location_info: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Save detection data to both Qdrant and PostgreSQL databases.
+        This is called periodically based on frame_skip configuration.
+        """
+        try:
+            if self.detection_data_service:
+                stream_id = stream_id_str if isinstance(stream_id_str, UUID) else UUID(str(stream_id_str))
+
+                # Get user_id from stream info
+                stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
+                
+                if stream_info:
+                    success = await self.detection_data_service.insert_detection_data(
+                        stream_id=stream_id ,
+                        workspace_id=workspace_id,
+                        user_id=stream_info['user_id'],
+                        camera_name=camera_name,
+                        username=owner_username,
+                        person_count=person_count,
+                        male_count=male_count,
+                        female_count=female_count,
+                        fire_status=fire_status,
+                        frame=frame,
+                        location_info=location_info,
+                    )
+                    
+                    if success:
+                        logger.debug(f"✅ Saved detection data for stream {stream_id_str}")
+                    else:
+                        logger.warning(f"⚠️ Failed to save detection data for stream {stream_id_str}")
+                else:
+                    logger.error(f"Could not get stream info for {stream_id_str}, skipping save")
+            else:
+                logger.warning("service not initialized, skipping save")
+            
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error saving detection data for stream {stream_id_str}: {e}", exc_info=True)
+            return False
+
+    async def _save_detection_old(
         self,
         stream_id_str: str,
         camera_name: str,

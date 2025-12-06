@@ -8,8 +8,7 @@ from fastapi import HTTPException, status
 
 from app.services.database import db_manager
 from app.services.user_service import user_manager
-  
-from app.services.unified_data_service import unified_data_service as qdrant_service
+from app.services.postgres_service import  postgres_service
 from app.services.workspace_service import workspace_service
 from app.utils import (
     ensure_uuid_str,
@@ -27,8 +26,8 @@ class CameraService:
     def __init__(self):
         self.db_manager = db_manager
         self.user_manager = user_manager
-        self.qdrant_service = qdrant_service
         self.workspace_service = workspace_service
+        self.postgres_service = postgres_service
 
     async def get_user_workspace(self, username: str) -> Tuple[UUID, UUID]:
         """Get user ID and workspace ID for a username."""
@@ -286,7 +285,7 @@ class CameraService:
     ) -> None:
         """Update Qdrant metadata for a camera."""
         try:
-            await self.qdrant_service.update_camera_metadata(
+            await self.postgres_service.update_camera_metadata(
                 stream_update=stream_update,
                 stream_id=stream_id,
                 workspace_id=workspace_id
@@ -375,7 +374,7 @@ class CameraService:
                 deleted_ids = valid_ids.copy()
                 
                 # Delete from Qdrant
-                qdrant_failures = await self.qdrant_service.delete_camera_data_from_workspaces(workspace_camera_mapping)
+                qdrant_failures = await self.postgres_service.delete_camera_data_from_workspaces(workspace_camera_mapping)
         
         return deleted_ids, unauthorized_ids, not_found_ids, qdrant_failures
 
@@ -385,7 +384,7 @@ class CameraService:
         current_user_data: Dict
     ) -> Dict:
         """Get timestamp range for workspace data."""
-        return await self.qdrant_service.get_timestamp_range(
+        return await self.postgres_service.get_timestamp_range(
             workspace_id=workspace_id,
             camera_ids=None,
             user_system_role=current_user_data.get("role"),

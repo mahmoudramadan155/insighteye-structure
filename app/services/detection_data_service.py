@@ -1,35 +1,28 @@
 # app/services/detection_data_service.py
 
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, List, Union
 from uuid import UUID, uuid4
-from datetime import datetime, timezone, time as dt_time
 import logging
 import numpy as np
-
 from app.services.qdrant_service import qdrant_service
 from app.services.postgres_service import postgres_service
-from app.utils import (
-    get_workspace_qdrant_collection_name,
-    parse_camera_ids,
-    parse_date_format,
-    parse_time_string
-)
+from app.utils import get_workspace_qdrant_collection_name
 from app.schemas import LocationSearchQuery
 
 logger = logging.getLogger(__name__)
 
 class DetectionDataService:
-    """Unified service for handling detection data across PostgreSQL and Qdrant"""
+    """service for handling detection data across PostgreSQL and Qdrant"""
     
     def __init__(self):
         self.qdrant_service = qdrant_service
         self.postgres_service = postgres_service
     
-    async def insert_detection_data_unified(
+    async def insert_detection_data(
         self,
-        stream_id: UUID,
-        workspace_id: UUID,
-        user_id: UUID,
+        stream_id: Union[str, UUID],
+        workspace_id: Union[str, UUID],
+        user_id: Union[str, UUID],
         camera_name: str,
         username: str,
         person_count: int,
@@ -53,7 +46,10 @@ class DetectionDataService:
         Returns:
             bool: Success status
         """
-        
+        stream_id = stream_id if isinstance(stream_id, UUID) else UUID(str(stream_id))
+        workspace_id = workspace_id if isinstance(workspace_id, UUID) else UUID(str(workspace_id))
+        user_id = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
+    
         result_id = uuid4()
         
         try:
@@ -97,14 +93,14 @@ class DetectionDataService:
                 if not qdrant_success:
                     logger.warning(f"Failed to insert frame into Qdrant for result_id {result_id}")
             
-            logger.info(f"Successfully inserted detection data with unified ID: {result_id}")
+            logger.info(f"Successfully inserted detection data with ID: {result_id}")
             return True
             
         except Exception as e:
-            logger.error(f"Error in unified detection data insertion: {e}", exc_info=True)
+            logger.error(f"Error in detection data insertion: {e}", exc_info=True)
             return False
     
-    async def retrieve_detection_data_unified(
+    async def retrieve_detection_data(
         self,
         workspace_id: UUID,
         user_system_role: str,
@@ -186,7 +182,7 @@ class DetectionDataService:
                     "num_of_pages": 0,
                     "total_count": 0,
                     "per_page": per_page,
-                    "source": "unified (PostgreSQL + Qdrant)",
+                    "source": "(PostgreSQL + Qdrant)",
                     "frames_included": include_frame
                 }
             
@@ -208,7 +204,7 @@ class DetectionDataService:
                         logger.debug(f"No frame found in Qdrant for result_id {result_id}")
             
             # Add source information
-            pg_results["source"] = "unified (PostgreSQL metadata + Qdrant frames)"
+            pg_results["source"] = "(PostgreSQL metadata + Qdrant frames)"
             pg_results["frames_included"] = include_frame
             pg_results["filters_applied"] = {
                 "camera_id": camera_id,
@@ -230,10 +226,10 @@ class DetectionDataService:
             return pg_results
             
         except Exception as e:
-            logger.error(f"Error retrieving unified detection data: {e}", exc_info=True)
+            logger.error(f"Error retrieving detection data: {e}", exc_info=True)
             raise
     
-    async def retrieve_single_detection_unified(
+    async def retrieve_single_detection(
         self,
         result_id: UUID,
         workspace_id: UUID,
@@ -292,7 +288,7 @@ class DetectionDataService:
                 "latitude": float(metadata['latitude']) if metadata['latitude'] else None,
                 "longitude": float(metadata['longitude']) if metadata['longitude'] else None,
                 "created_at": metadata['created_at'].isoformat() if metadata['created_at'] else None,
-                "source": "unified (PostgreSQL + Qdrant)"
+                "source": "(PostgreSQL + Qdrant)"
             }
             
             # Get frame from Qdrant if requested

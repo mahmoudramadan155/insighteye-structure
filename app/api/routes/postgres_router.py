@@ -1,15 +1,16 @@
 # app/routes/postgres_router.py
 from fastapi import APIRouter, HTTPException, Query, Body, Depends, status, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from typing import Optional, Dict, List, Union, Any
-from uuid import UUID
+from typing import Optional, Dict, List
 import logging
 import io
 
 from app.services.postgres_service import postgres_service
+from app.services.detection_data_service import detection_data_service
 from app.services.database import db_manager
 from app.services.user_service import user_manager
 from app.services.session_service import session_manager
+from app.services.workspace_service import workspace_service
 from app.schemas import (
     SearchQuery, LocationSearchQuery, DeleteDataRequest, StreamUpdate,
     TimestampRangeResponse, CameraIdsResponse
@@ -21,9 +22,8 @@ router = APIRouter(tags=["postgres_data"], prefix="/postgres")
 
 # ========== Search Endpoints ==========
 
-@router.get("/workspace/search_results")
-async def workspace_search_results(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
+@router.get("/workspace/search_results1")
+async def workspace_search_results1(
     camera_id_param: Optional[str] = Query(None, alias="camera_id"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
@@ -46,24 +46,11 @@ async def workspace_search_results(
         system_role = user_db_info.get("role")
         is_system_admin = (system_role == "admin")
         
-        # Determine workspace
-        if workspace_id_query:
-            try:
-                final_workspace_id = UUID(workspace_id_query)
-            except ValueError:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
-        else:
-            # Get user's active workspace
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (requesting_user_id,), fetch_one=True)
-            if not ws_result:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-            final_workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+        
         
         # Check permissions
         workspace_role = None
@@ -73,7 +60,7 @@ async def workspace_search_results(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, final_workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -119,7 +106,7 @@ async def workspace_search_results(
         
         # Execute search
         results = await postgres_service.search_workspace_data(
-            workspace_id=final_workspace_id,
+            workspace_id=workspace_id_obj,
             search_query=search_query,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
@@ -131,7 +118,7 @@ async def workspace_search_results(
         
         # Add search scope info
         results["search_scope"] = {
-            "workspace_id": str(final_workspace_id),
+            "workspace_id": str(workspace_id_obj),
             "database": "postgresql",
             "filters_applied": search_query.model_dump(exclude_none=True),
             "access_level": "system_admin" if is_system_admin else (workspace_role or "member"),
@@ -150,9 +137,8 @@ async def workspace_search_results(
             detail="Error during workspace data search."
         )
 
-@router.get("/workspace/search_results_with_location")
-async def workspace_search_results_with_location(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
+@router.get("/workspace/search_results_with_location1")
+async def workspace_search_results_with_location1(
     camera_id_param: Optional[str] = Query(None, alias="camera_id"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
@@ -179,20 +165,10 @@ async def workspace_search_results_with_location(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            final_workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (requesting_user_id,), fetch_one=True)
-            if not ws_result:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-            final_workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -202,7 +178,7 @@ async def workspace_search_results_with_location(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, final_workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -233,7 +209,7 @@ async def workspace_search_results_with_location(
         )
         
         results = await postgres_service.search_workspace_data(
-            workspace_id=final_workspace_id,
+            workspace_id=workspace_id_obj,
             search_query=search_query,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
@@ -243,6 +219,255 @@ async def workspace_search_results_with_location(
             include_frame=include_frame
         )
 
+        if "search_scope" not in results:
+            results["search_scope"] = {}
+
+        results["search_scope"]["location_filters"] = {
+            "location": location,
+            "area": area,
+            "building": building,
+            "floor_level": floor_level,
+            "zone": zone
+        }
+        
+        return JSONResponse(content=results)
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Location search error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error during location-based search."
+        )
+
+@router.get("/search_results1")
+async def search_results_user_active_workspace1(
+    camera_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    start_time: Optional[str] = Query(None),
+    end_time: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: Optional[str] = Query(None),
+    include_frame: bool = Query(True),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Search in user's active workspace"""
+    return await workspace_search_results(
+        camera_id_param=camera_id,
+        start_date=start_date,
+        end_date=end_date,
+        start_time=start_time,
+        end_time=end_time,
+        page=page,
+        per_page=per_page,
+        include_frame=include_frame,
+        current_user_data=current_user_data
+    )
+
+# ========== Search Endpoints ==========
+
+@router.get("/workspace/search_results")
+async def workspace_search_results(
+    camera_id_param: Optional[str] = Query(None, alias="camera_id"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    start_time: Optional[str] = Query(None),
+    end_time: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: Optional[str] = Query(None),
+    include_frame: bool = Query(True),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Search workspace data using detection_data_service (PostgreSQL metadata + Qdrant frames)"""
+    try:
+        requesting_user_id = current_user_data["user_id"]
+        username = current_user_data["username"]
+        
+        user_db_info = await user_manager.get_user_by_id(requesting_user_id)
+        if not user_db_info:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        
+        system_role = user_db_info.get("role")
+        is_system_admin = (system_role == "admin")
+        
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+        
+        # Check permissions
+        workspace_role = None
+        if not is_system_admin:
+            member_query = """
+                SELECT role FROM workspace_members 
+                WHERE user_id = $1 AND workspace_id = $2
+            """
+            member_result = await db_manager.execute_query(
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
+            )
+            if not member_result:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not a member of this workspace."
+                )
+            workspace_role = member_result['role']
+        
+        # Check search feature access
+        can_search = user_db_info.get("is_search", False) or \
+                    is_system_admin or \
+                    (workspace_role in ["admin", "owner"])
+        
+        if not can_search:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Search feature unavailable for your account."
+            )
+        
+        # Process per_page parameter
+        processed_per_page = None
+        if per_page and per_page.lower() not in ["none", "null", ""]:
+            try:
+                processed_per_page = int(per_page)
+                if processed_per_page < 1 or processed_per_page > 100:
+                    raise ValueError("Invalid range")
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="per_page must be between 1 and 100"
+                )
+        elif per_page is None:
+            processed_per_page = 10
+        
+        # Parse camera IDs
+        parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
+        
+        # ===== USE DETECTION_DATA_SERVICE INSTEAD =====
+        results = await detection_data_service.retrieve_detection_data(
+            workspace_id=workspace_id_obj,
+            user_system_role=system_role,
+            user_workspace_role=workspace_role,
+            requesting_username=username,
+            camera_id=parsed_camera_ids,
+            start_date=start_date,
+            end_date=end_date,
+            start_time=start_time,
+            end_time=end_time,
+            page=page,
+            per_page=processed_per_page,
+            include_frame=include_frame
+        )
+        
+        # Add search scope info
+        results["search_scope"] = {
+            "workspace_id": str(workspace_id_obj),
+            "database": "postgresql_qdrant_combined",
+            "filters_applied": {
+                "camera_id": parsed_camera_ids,
+                "start_date": start_date,
+                "end_date": end_date,
+                "start_time": start_time,
+                "end_time": end_time
+            },
+            "access_level": "system_admin" if is_system_admin else (workspace_role or "member"),
+            "frames_included": include_frame,
+            "pagination_disabled": processed_per_page is None
+        }
+        
+        return JSONResponse(content=results)
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Workspace search error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error during workspace data search."
+        )
+
+@router.get("/workspace/search_results_with_location")
+async def workspace_search_results_with_location(
+    camera_id_param: Optional[str] = Query(None, alias="camera_id"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    start_time: Optional[str] = Query(None),
+    end_time: Optional[str] = Query(None),
+    location: Optional[str] = Query(None),
+    area: Optional[str] = Query(None),
+    building: Optional[str] = Query(None),
+    floor_level: Optional[str] = Query(None),
+    zone: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: Optional[str] = Query(None),
+    include_frame: bool = Query(True),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Enhanced search with location-based filtering using detection_data_service"""
+    try:
+        requesting_user_id = current_user_data["user_id"]
+        username = current_user_data["username"]
+        
+        user_db_info = await user_manager.get_user_by_id(requesting_user_id)
+        if not user_db_info:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        
+        system_role = user_db_info.get("role")
+        
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+        
+        # Check permissions
+        workspace_role = None
+        if system_role != "admin":
+            member_query = """
+                SELECT role FROM workspace_members 
+                WHERE user_id = $1 AND workspace_id = $2
+            """
+            member_result = await db_manager.execute_query(
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
+            )
+            if not member_result:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not a member of this workspace."
+                )
+            workspace_role = member_result['role']
+        
+        # Process per_page
+        processed_per_page = None
+        if per_page and per_page.lower() not in ["none", "null", ""]:
+            processed_per_page = int(per_page)
+        elif per_page is None:
+            processed_per_page = 10
+        
+        # Parse camera IDs
+        parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
+        
+        # ===== USE DETECTION_DATA_SERVICE WITH LOCATION FILTERS =====
+        results = await detection_data_service.retrieve_detection_data(
+            workspace_id=workspace_id_obj,
+            user_system_role=system_role,
+            user_workspace_role=workspace_role,
+            requesting_username=username,
+            camera_id=parsed_camera_ids,
+            start_date=start_date,
+            end_date=end_date,
+            start_time=start_time,
+            end_time=end_time,
+            location=location,
+            area=area,
+            building=building,
+            floor_level=floor_level,
+            zone=zone,
+            page=page,
+            per_page=processed_per_page,
+            include_frame=include_frame
+        )
+
+        # Add location filters to search scope
         if "search_scope" not in results:
             results["search_scope"] = {}
 
@@ -277,9 +502,8 @@ async def search_results_user_active_workspace(
     include_frame: bool = Query(True),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
-    """Search in user's active workspace"""
+    """Search in user's active workspace (delegates to workspace_search_results)"""
     return await workspace_search_results(
-        workspace_id_query=None,
         camera_id_param=camera_id,
         start_date=start_date,
         end_date=end_date,
@@ -291,11 +515,135 @@ async def search_results_user_active_workspace(
         current_user_data=current_user_data
     )
 
+# ========== Prediction Endpoints ==========
+
+@router.get("/workspace/prediction_data")
+async def workspace_prediction_endpoint(
+    camera_id_param: Optional[str] = Query(None, alias="camera_id"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    start_time: Optional[str] = Query(None),
+    end_time: Optional[str] = Query(None),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get prediction data for cameras"""
+    try:
+        requesting_user_id = current_user_data["user_id"]
+        username = current_user_data["username"]
+        
+        user_db_info = await user_manager.get_user_by_id(requesting_user_id)
+        if not user_db_info:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        
+        system_role = user_db_info.get("role")
+        is_system_admin = (system_role == "admin")
+        
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+        
+        # Check permissions
+        workspace_role = None
+        if not is_system_admin:
+            member_query = """
+                SELECT role FROM workspace_members 
+                WHERE user_id = $1 AND workspace_id = $2
+            """
+            member_result = await db_manager.execute_query(
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
+            )
+            if not member_result:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not a member of this workspace."
+                )
+            workspace_role = member_result['role']
+        
+        # Check prediction feature access
+        can_predict = user_db_info.get("is_prediction", False) or \
+                     is_system_admin or \
+                     (workspace_role in ["admin", "owner"])
+        
+        if not can_predict:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Prediction feature unavailable."
+            )
+        
+        # Get camera IDs
+        parsed_camera_ids = []
+        if camera_id_param:
+            raw_ids = parse_camera_ids(camera_id_param)
+            if raw_ids:
+                placeholders = ', '.join([f'${i+1}' for i in range(len(raw_ids))])
+                query = f"""
+                    SELECT stream_id, name FROM video_stream 
+                    WHERE stream_id IN ({placeholders}) AND workspace_id = ${len(raw_ids) + 1}
+                """
+                params = tuple(raw_ids + [workspace_id_obj])
+                cam_names_db = await db_manager.execute_query(query, params, fetch_all=True)
+                cam_details_map = {str(row['stream_id']): row['name'] for row in cam_names_db}
+                parsed_camera_ids = [(cid, cam_details_map.get(cid, f"Camera {cid[:8]}")) for cid in raw_ids]
+        else:
+            query = "SELECT stream_id, name FROM video_stream WHERE workspace_id = $1 AND status = 'active'"
+            db_cameras = await db_manager.execute_query(query, (workspace_id_obj,), fetch_all=True)
+            if db_cameras:
+                parsed_camera_ids = [(str(cam['stream_id']), cam['name']) for cam in db_cameras]
+        
+        if not parsed_camera_ids:
+            return JSONResponse({"predictions": [], "message": "No cameras found."})
+        
+        search_query = SearchQuery(
+            start_date=start_date,
+            end_date=end_date,
+            start_time=start_time,
+            end_time=end_time
+        )
+        
+        predictions = await postgres_service.get_prediction_data(
+            workspace_id=workspace_id_obj,
+            camera_ids=parsed_camera_ids,
+            search_query=search_query,
+            user_system_role=system_role,
+            user_workspace_role=workspace_role,
+            requesting_username=username
+        )
+        
+        return JSONResponse({"predictions": predictions})
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Prediction error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error during prediction."
+        )
+
+@router.get("/prediction_data")
+async def prediction_data_user_active_workspace(
+    camera_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    start_time: Optional[str] = Query(None),
+    end_time: Optional[str] = Query(None),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get predictions for user's active workspace"""
+    return await workspace_prediction_endpoint(
+        camera_id_param=camera_id,
+        start_date=start_date,
+        end_date=end_date,
+        start_time=start_time,
+        end_time=end_time,
+        current_user_data=current_user_data
+    )
+
 # ========== Statistics Endpoints ==========
 
 @router.get("/workspace/statistics")
 async def get_workspace_statistics(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get comprehensive statistics for a workspace"""
@@ -309,20 +657,10 @@ async def get_workspace_statistics(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            final_workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (requesting_user_id,), fetch_one=True)
-            if not ws_result:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-            final_workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -332,7 +670,7 @@ async def get_workspace_statistics(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, final_workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -343,7 +681,7 @@ async def get_workspace_statistics(
         
         # Get statistics
         stats = await postgres_service.get_workspace_statistics(
-            workspace_id=final_workspace_id,
+            workspace_id=workspace_id_obj,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
             requesting_username=username
@@ -364,7 +702,6 @@ async def get_workspace_statistics(
 
 @router.get("/workspace/export")
 async def export_workspace_data(
-    workspace_id_query: str = Query(..., alias="workspaceId"),
     format: str = Query("csv", regex="^(csv|json)$"),
     camera_id_param: Optional[str] = Query(None, alias="camera_id"),
     start_date: Optional[str] = Query(None),
@@ -385,14 +722,10 @@ async def export_workspace_data(
         
         system_role = user_db_info.get("role")
         
-        # Validate workspace ID
-        try:
-            workspace_id = UUID(workspace_id_query)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace_id format."
-            )
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -402,7 +735,7 @@ async def export_workspace_data(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -424,7 +757,7 @@ async def export_workspace_data(
         
         # Execute export
         file_data, media_type, filename = await postgres_service.export_workspace_data(
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             search_query=search_query,
             format=format,
             user_system_role=system_role,
@@ -437,7 +770,7 @@ async def export_workspace_data(
         await session_manager.log_action(
             content=f"User '{username}' exported workspace data in {format.upper()} format",
             user_id=requesting_user_id,
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             action_type="Data_Exported",
             status="success"
         )
@@ -464,7 +797,6 @@ async def export_workspace_data(
 @router.get("/timestamp-range", response_model=TimestampRangeResponse)
 async def get_timestamp_range_endpoint(
     camera_id: Optional[str] = Query(None),
-    workspace_id: Optional[str] = Query(None),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get timestamp range for data"""
@@ -473,33 +805,10 @@ async def get_timestamp_range_endpoint(
         username = current_user_data["username"]
         system_role = current_user_data.get("role")
         
-        # Determine workspace
-        if workspace_id:
-            target_ws_id = UUID(workspace_id)
-            if system_role != "admin":
-                member_query = """
-                    SELECT role FROM workspace_members 
-                    WHERE user_id = $1 AND workspace_id = $2
-                """
-                member_result = await db_manager.execute_query(
-                    member_query, (requesting_user_id, target_ws_id), fetch_one=True
-                )
-                if not member_result:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="You are not a member of this workspace."
-                    )
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (requesting_user_id,), fetch_one=True)
-            if not ws_result:
-                return TimestampRangeResponse()
-            target_ws_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            return TimestampRangeResponse()
         
         # Get workspace role
         workspace_role = None
@@ -509,22 +818,20 @@ async def get_timestamp_range_endpoint(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, target_ws_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             workspace_role = member_result['role'] if member_result else None
         
         parsed_camera_ids = parse_camera_ids(camera_id) if camera_id else None
         
         return await postgres_service.get_timestamp_range(
-            workspace_id=target_ws_id,
+            workspace_id=workspace_id_obj,
             camera_ids=parsed_camera_ids,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
             requesting_username=username
         )
         
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspace_id format.")
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -536,29 +843,18 @@ async def get_timestamp_range_endpoint(
 
 @router.get("/camera-ids", response_model=CameraIdsResponse)
 async def get_all_camera_ids_for_active_workspace(
-    workspace_id: Optional[str] = Query(None),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get all camera IDs for workspace"""
     try:
-        requesting_user_id = current_user_data["user_id"]
+        username = current_user_data["username"]
         
-        # Determine workspace
-        if workspace_id:
-            target_ws_id = UUID(workspace_id)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (requesting_user_id,), fetch_one=True)
-            if not ws_result:
-                return CameraIdsResponse(camera_ids=[], count=0)
-            target_ws_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            return CameraIdsResponse(camera_ids=[], count=0)
         
-        cameras = await postgres_service.get_camera_ids_for_workspace(target_ws_id)
+        cameras = await postgres_service.get_camera_ids_for_workspace(workspace_id_obj)
         
         return CameraIdsResponse(
             camera_ids=[cam["id"] for cam in cameras],
@@ -576,7 +872,6 @@ async def get_all_camera_ids_for_active_workspace(
 
 @router.get("/workspace/locations")
 async def get_unique_locations(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     area: Optional[str] = Query(None),
     building: Optional[str] = Query(None),
     floor_level: Optional[str] = Query(None),
@@ -594,20 +889,10 @@ async def get_unique_locations(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (requesting_user_id,), fetch_one=True)
-            if not ws_result:
-                return {"locations": [], "total_count": 0}
-            workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            return {"locations": [], "total_count": 0}
         
         # Check permissions
         workspace_role = None
@@ -617,7 +902,7 @@ async def get_unique_locations(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -627,7 +912,7 @@ async def get_unique_locations(
             workspace_role = member_result['role']
         
         result = await postgres_service.get_unique_locations(
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             area=area,
             building=building,
             floor_level=floor_level,
@@ -653,7 +938,6 @@ async def get_unique_locations(
 @router.delete("/workspace/delete_data")
 async def delete_data_from_workspace(
     request_body: DeleteDataRequest,
-    workspace_id_to_target: str = Query(..., description="Target workspace ID"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Delete data from workspace"""
@@ -668,14 +952,10 @@ async def delete_data_from_workspace(
         system_role = user_db_info.get("role")
         is_system_admin = (system_role == "admin")
         
-        # Validate workspace ID
-        try:
-            target_workspace_id = UUID(workspace_id_to_target)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace_id format."
-            )
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions - must be workspace admin/owner or system admin
         workspace_role = None
@@ -685,7 +965,7 @@ async def delete_data_from_workspace(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, target_workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -702,7 +982,7 @@ async def delete_data_from_workspace(
         
         # Execute deletion
         result = await postgres_service.delete_data(
-            workspace_id=target_workspace_id,
+            workspace_id=workspace_id_obj,
             delete_request=request_body,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
@@ -711,11 +991,11 @@ async def delete_data_from_workspace(
         
         # Log the action
         await session_manager.log_action(
-            content=f"User '{username}' deleted data from workspace '{target_workspace_id}'. "
+            content=f"User '{username}' deleted data from workspace '{workspace_id_obj}'. "
                    f"Filters: {request_body.model_dump(exclude_none=True)}. "
                    f"Deleted {result.get('deleted_count', 0)} points.",
             user_id=requesting_user_id,
-            workspace_id=target_workspace_id,
+            workspace_id=workspace_id_obj,
             action_type="PostgreSQL_Data_Deleted",
             status="success" if result.get('status') == 'success' else "failure"
         )
@@ -733,7 +1013,6 @@ async def delete_data_from_workspace(
 
 @router.delete("/workspace/delete_all_data")
 async def delete_all_workspace_data(
-    workspace_id_to_target: str = Query(..., description="Target workspace ID"),
     confirm: bool = Query(False, description="Confirmation flag - must be true"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -760,14 +1039,10 @@ async def delete_all_workspace_data(
         system_role = user_db_info.get("role")
         is_system_admin = (system_role == "admin")
         
-        # Validate workspace ID
-        try:
-            target_workspace_id = UUID(workspace_id_to_target)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace_id format."
-            )
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -777,7 +1052,7 @@ async def delete_all_workspace_data(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, target_workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -794,7 +1069,7 @@ async def delete_all_workspace_data(
         
         # Execute deletion
         result = await postgres_service.delete_all_workspace_data(
-            workspace_id=target_workspace_id,
+            workspace_id=workspace_id_obj,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
             requesting_username=username
@@ -802,10 +1077,10 @@ async def delete_all_workspace_data(
         
         # Log the action
         await session_manager.log_action(
-            content=f"User '{username}' deleted ALL data from workspace '{target_workspace_id}'. "
+            content=f"User '{username}' deleted ALL data from workspace '{workspace_id_obj}'. "
                    f"Deleted {result.get('deleted_count', 0)} total points.",
             user_id=requesting_user_id,
-            workspace_id=target_workspace_id,
+            workspace_id=workspace_id_obj,
             action_type="PostgreSQL_All_Data_Deleted",
             status="warning"
         )
@@ -825,7 +1100,6 @@ async def delete_all_workspace_data(
 
 @router.get("/workspace/preview_metadata_update")
 async def preview_metadata_update_endpoint(
-    workspace_id_query: str = Query(..., alias="workspaceId"),
     camera_ids: Optional[str] = Query(None, description="Comma-separated camera IDs to preview"),
     limit: int = Query(10, ge=1, le=100, description="Number of sample points to return"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -845,14 +1119,10 @@ async def preview_metadata_update_endpoint(
         system_role = user_db_info.get("role")
         is_system_admin = (system_role == "admin")
         
-        # Validate workspace ID
-        try:
-            workspace_id = UUID(workspace_id_query)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace_id format."
-            )
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -862,7 +1132,7 @@ async def preview_metadata_update_endpoint(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -878,7 +1148,7 @@ async def preview_metadata_update_endpoint(
         
         # Execute preview
         result = await postgres_service.preview_metadata_update(
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             camera_ids=parsed_camera_ids,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
@@ -899,7 +1169,6 @@ async def preview_metadata_update_endpoint(
 
 @router.post("/workspace/update_metadata_by_id")
 async def update_camera_metadata_by_id(
-    workspace_id_query: str = Query(..., alias="workspaceId"),
     stream_update: StreamUpdate = Body(..., description="Stream update with camera ID"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -917,14 +1186,10 @@ async def update_camera_metadata_by_id(
         system_role = user_db_info.get("role")
         is_system_admin = (system_role == "admin")
         
-        # Validate workspace ID
-        try:
-            workspace_id = UUID(workspace_id_query)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace_id format."
-            )
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -934,7 +1199,7 @@ async def update_camera_metadata_by_id(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -959,7 +1224,7 @@ async def update_camera_metadata_by_id(
         
         # Execute metadata update
         result = await postgres_service.update_camera_metadata_by_id(
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             camera_id=camera_id,
             stream_update=stream_update,
             user_system_role=system_role,
@@ -969,10 +1234,10 @@ async def update_camera_metadata_by_id(
         
         # Log the action
         await session_manager.log_action(
-            content=f"User '{username}' updated metadata for camera '{camera_id}' in workspace '{workspace_id}'. "
+            content=f"User '{username}' updated metadata for camera '{camera_id}' in workspace '{workspace_id_obj}'. "
                    f"Affected {result.get('updated_count', 0)} data points.",
             user_id=requesting_user_id,
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             action_type="PostgreSQL_Metadata_Updated",
             status="success" if result.get('status') == 'success' else "failure"
         )
@@ -990,7 +1255,6 @@ async def update_camera_metadata_by_id(
 
 @router.post("/workspace/update_metadata")
 async def bulk_update_metadata(
-    workspace_id_query: str = Query(..., alias="workspaceId"),
     camera_ids: Optional[str] = Query(None, description="Comma-separated camera IDs to update"),
     metadata_updates: StreamUpdate = Body(..., description="Metadata fields to update"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1009,14 +1273,10 @@ async def bulk_update_metadata(
         system_role = user_db_info.get("role")
         is_system_admin = (system_role == "admin")
         
-        # Validate workspace ID
-        try:
-            workspace_id = UUID(workspace_id_query)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace_id format."
-            )
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -1026,7 +1286,7 @@ async def bulk_update_metadata(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1060,7 +1320,7 @@ async def bulk_update_metadata(
         
         # Execute metadata update
         result = await postgres_service.bulk_update_metadata(
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             camera_ids=parsed_camera_ids,
             metadata_updates=metadata_dict,
             user_system_role=system_role,
@@ -1074,11 +1334,11 @@ async def bulk_update_metadata(
             camera_info += f" and {len(parsed_camera_ids) - 5} more"
         
         await session_manager.log_action(
-            content=f"User '{username}' updated metadata in workspace '{workspace_id}' for {camera_info}. "
+            content=f"User '{username}' updated metadata in workspace '{workspace_id_obj}' for {camera_info}. "
                    f"Fields updated: {', '.join(metadata_dict.keys())}. "
                    f"Affected {result.get('updated_count', 0)} data points.",
             user_id=requesting_user_id,
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             action_type="PostgreSQL_Metadata_Updated",
             status="success" if result.get('status') == 'success' else "failure"
         )
@@ -1096,7 +1356,6 @@ async def bulk_update_metadata(
 
 @router.post("/workspace/batch_update_metadata")
 async def batch_update_metadata_for_cameras(
-    workspace_id_query: str = Query(..., alias="workspaceId"),
     stream_updates: List[StreamUpdate] = Body(..., description="List of stream updates"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1114,14 +1373,10 @@ async def batch_update_metadata_for_cameras(
         system_role = user_db_info.get("role")
         is_system_admin = (system_role == "admin")
         
-        # Validate workspace ID
-        try:
-            workspace_id = UUID(workspace_id_query)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid workspace_id format."
-            )
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check permissions
         workspace_role = None
@@ -1131,7 +1386,7 @@ async def batch_update_metadata_for_cameras(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (requesting_user_id, workspace_id), fetch_one=True
+                member_query, (requesting_user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1170,7 +1425,7 @@ async def batch_update_metadata_for_cameras(
             # Update metadata for this camera
             try:
                 result = await postgres_service.update_camera_metadata_by_id(
-                    workspace_id=workspace_id,
+                    workspace_id=workspace_id_obj,
                     camera_id=camera_id,
                     stream_update=stream_update,
                     user_system_role=system_role,
@@ -1199,9 +1454,9 @@ async def batch_update_metadata_for_cameras(
         # Log the batch action
         await session_manager.log_action(
             content=f"User '{username}' batch updated metadata for {len(stream_updates)} cameras "
-                   f"in workspace '{workspace_id}'. Total data points affected: {total_updated}.",
+                   f"in workspace '{workspace_id_obj}'. Total data points affected: {total_updated}.",
             user_id=requesting_user_id,
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             action_type="PostgreSQL_Batch_Metadata_Updated",
             status="success"
         )
@@ -1210,7 +1465,7 @@ async def batch_update_metadata_for_cameras(
             "batch_results": results,
             "total_cameras_processed": len(stream_updates),
             "total_data_points_updated": total_updated,
-            "workspace_id": str(workspace_id)
+            "workspace_id": str(workspace_id_obj)
         })
         
     except HTTPException as e:
@@ -1226,7 +1481,6 @@ async def batch_update_metadata_for_cameras(
 
 @router.get("/locations/list")
 async def get_postgres_locations(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get all unique locations from PostgreSQL data."""
@@ -1240,20 +1494,11 @@ async def get_postgres_locations(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (user_id,), fetch_one=True)
-            if not ws_result:
-                return {"locations": [], "total_count": 0}
-            workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+        
         
         # Check workspace permissions
         workspace_role = None
@@ -1263,7 +1508,7 @@ async def get_postgres_locations(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id), fetch_one=True
+                member_query, (user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1274,7 +1519,7 @@ async def get_postgres_locations(
         
         # Get location data
         result = await postgres_service.get_unique_locations(
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             user_system_role=system_role,
             user_workspace_role=workspace_role,
             requesting_username=username
@@ -1293,7 +1538,6 @@ async def get_postgres_locations(
 
 @router.get("/areas/list")
 async def get_postgres_areas(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     locations: Optional[str] = Query(None, description="Filter by location(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1310,20 +1554,10 @@ async def get_postgres_areas(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (user_id,), fetch_one=True)
-            if not ws_result:
-                return {"areas": [], "total_count": 0, "filtered_by_locations": parsed_locations}
-            workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check workspace permissions
         workspace_role = None
@@ -1333,7 +1567,7 @@ async def get_postgres_areas(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id), fetch_one=True
+                member_query, (user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1344,7 +1578,7 @@ async def get_postgres_areas(
         
         # Build query with location filter
         conditions = ["workspace_id = $1"]
-        params = [workspace_id]
+        params = [workspace_id_obj]
         param_count = 1
         
         if parsed_locations:
@@ -1392,7 +1626,7 @@ async def get_postgres_areas(
             "areas": areas,
             "total_count": len(areas),
             "filtered_by_locations": parsed_locations,
-            "workspace_id": str(workspace_id),
+            "workspace_id": str(workspace_id_obj),
             "database": "postgresql"
         })
         
@@ -1407,7 +1641,6 @@ async def get_postgres_areas(
 
 @router.get("/buildings/list")
 async def get_postgres_buildings(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     areas: Optional[str] = Query(None, description="Filter by area(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1424,20 +1657,11 @@ async def get_postgres_buildings(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (user_id,), fetch_one=True)
-            if not ws_result:
-                return {"buildings": [], "total_count": 0, "filtered_by_areas": parsed_areas}
-            workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+        
         
         # Check workspace permissions
         workspace_role = None
@@ -1447,7 +1671,7 @@ async def get_postgres_buildings(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id), fetch_one=True
+                member_query, (user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1458,7 +1682,7 @@ async def get_postgres_buildings(
         
         # Build query with area filter
         conditions = ["workspace_id = $1"]
-        params = [workspace_id]
+        params = [workspace_id_obj]
         param_count = 1
         
         if parsed_areas:
@@ -1507,7 +1731,7 @@ async def get_postgres_buildings(
             "buildings": buildings,
             "total_count": len(buildings),
             "filtered_by_areas": parsed_areas,
-            "workspace_id": str(workspace_id),
+            "workspace_id": str(workspace_id_obj),
             "database": "postgresql"
         })
         
@@ -1522,7 +1746,6 @@ async def get_postgres_buildings(
 
 @router.get("/floor-levels/list")
 async def get_postgres_floor_levels(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     buildings: Optional[str] = Query(None, description="Filter by building(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1539,20 +1762,11 @@ async def get_postgres_floor_levels(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (user_id,), fetch_one=True)
-            if not ws_result:
-                return {"floor_levels": [], "total_count": 0, "filtered_by_buildings": parsed_buildings}
-            workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+        
         
         # Check workspace permissions
         workspace_role = None
@@ -1562,7 +1776,7 @@ async def get_postgres_floor_levels(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id), fetch_one=True
+                member_query, (user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1573,7 +1787,7 @@ async def get_postgres_floor_levels(
         
         # Build query with building filter
         conditions = ["workspace_id = $1"]
-        params = [workspace_id]
+        params = [workspace_id_obj]
         param_count = 1
         
         if parsed_buildings:
@@ -1623,7 +1837,7 @@ async def get_postgres_floor_levels(
             "floor_levels": floor_levels,
             "total_count": len(floor_levels),
             "filtered_by_buildings": parsed_buildings,
-            "workspace_id": str(workspace_id),
+            "workspace_id": str(workspace_id_obj),
             "database": "postgresql"
         })
         
@@ -1638,7 +1852,6 @@ async def get_postgres_floor_levels(
 
 @router.get("/zones/list")
 async def get_postgres_zones(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     floor_levels: Optional[str] = Query(None, description="Filter by floor level(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1655,20 +1868,10 @@ async def get_postgres_zones(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (user_id,), fetch_one=True)
-            if not ws_result:
-                return {"zones": [], "total_count": 0, "filtered_by_floor_levels": parsed_floor_levels}
-            workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check workspace permissions
         workspace_role = None
@@ -1678,7 +1881,7 @@ async def get_postgres_zones(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id), fetch_one=True
+                member_query, (user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1689,7 +1892,7 @@ async def get_postgres_zones(
         
         # Build query with floor level filter
         conditions = ["workspace_id = $1"]
-        params = [workspace_id]
+        params = [workspace_id_obj]
         param_count = 1
         
         if parsed_floor_levels:
@@ -1740,7 +1943,7 @@ async def get_postgres_zones(
             "zones": zones,
             "total_count": len(zones),
             "filtered_by_floor_levels": parsed_floor_levels,
-            "workspace_id": str(workspace_id),
+            "workspace_id": str(workspace_id_obj),
             "database": "postgresql"
         })
         
@@ -1755,7 +1958,6 @@ async def get_postgres_zones(
 
 @router.get("/locations/summary")
 async def get_location_summary_postgres(
-    workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get comprehensive summary of all location data from PostgreSQL."""
@@ -1769,27 +1971,10 @@ async def get_location_summary_postgres(
         
         system_role = user_db_info.get("role")
         
-        # Determine workspace
-        if workspace_id_query:
-            workspace_id = UUID(workspace_id_query)
-        else:
-            ws_query = """
-                SELECT workspace_id FROM workspace_members 
-                WHERE user_id = $1 
-                ORDER BY created_at DESC 
-                LIMIT 1
-            """
-            ws_result = await db_manager.execute_query(ws_query, (user_id,), fetch_one=True)
-            if not ws_result:
-                return {
-                    "summary": {
-                        "locations": 0, "areas": 0, "buildings": 0,
-                        "floor_levels": 0, "zones": 0, "total_cameras": 0
-                    },
-                    "hierarchy": [],
-                    "database": "postgresql"
-                }
-            workspace_id = ws_result['workspace_id']
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check workspace permissions
         workspace_role = None
@@ -1799,7 +1984,7 @@ async def get_location_summary_postgres(
                 WHERE user_id = $1 AND workspace_id = $2
             """
             member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id), fetch_one=True
+                member_query, (user_id, workspace_id_obj), fetch_one=True
             )
             if not member_result:
                 raise HTTPException(
@@ -1810,7 +1995,7 @@ async def get_location_summary_postgres(
         
         # Build base conditions
         conditions = ["workspace_id = $1"]
-        params = [workspace_id]
+        params = [workspace_id_obj]
         
         # User access control
         if system_role != 'admin' and workspace_role not in ['admin', 'owner']:
@@ -1875,7 +2060,7 @@ async def get_location_summary_postgres(
                 "total_cameras": summary_result['total_cameras']
             },
             "hierarchy": hierarchy,
-            "workspace_id": str(workspace_id),
+            "workspace_id": str(workspace_id_obj),
             "database": "postgresql",
             "data_source": "postgresql"
         })
@@ -1889,7 +2074,7 @@ async def get_location_summary_postgres(
             detail="Failed to retrieve location summary."
         )
 
-@router.get("/postgres/locations/search")
+@router.get("/locations/search")
 async def search_location_data(
     search_term: str = Query(..., min_length=1, description="Search term"),
     search_fields: List[str] = Query(
@@ -1911,14 +2096,10 @@ async def search_location_data(
         
         system_role = user_db_info.get("role")
         
-        # Get active workspace
-        _, workspace_id = await postgres_service.get_user_workspace_info(username)
-        if not workspace_id:
-            return {
-                "results": [],
-                "search_term": search_term,
-                "message": "No active workspace found"
-            }
+        # Get workspace using workspace_service
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
         
         # Check workspace permissions
         workspace_role = None
@@ -1926,7 +2107,7 @@ async def search_location_data(
             try:
                 query = "SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2"
                 member_info = await db_manager.execute_query(
-                    query, (user_id, workspace_id), fetch_one=True
+                    query, (user_id, workspace_id_obj), fetch_one=True
                 )
                 if not member_info:
                     raise HTTPException(
@@ -1945,7 +2126,7 @@ async def search_location_data(
         
         # Search
         result = await postgres_service.search_location_data(
-            workspace_id=workspace_id,
+            workspace_id=workspace_id_obj,
             search_term=search_term,
             search_fields=search_fields,
             exact_match=exact_match,

@@ -1202,7 +1202,7 @@ async def get_workspace_cameras(
 
 # ========== Location Hierarchy Endpoints ==========
 
-@router.get("/elasticsearch/locations")
+@router.get("/locations")
 async def get_locations(
     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1254,7 +1254,7 @@ async def get_locations(
             detail="Failed to retrieve locations."
         )
 
-@router.get("/elasticsearch/areas")
+@router.get("/areas")
 async def get_areas(
     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     location: Optional[str] = Query(None),
@@ -1306,7 +1306,7 @@ async def get_areas(
             detail="Failed to retrieve areas."
         )
 
-@router.get("/elasticsearch/buildings")
+@router.get("/buildings")
 async def get_buildings(
     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     location: Optional[str] = Query(None),
@@ -1359,7 +1359,7 @@ async def get_buildings(
             detail="Failed to retrieve buildings."
         )
 
-@router.get("/elasticsearch/floor_levels")
+@router.get("/floor_levels")
 async def get_floor_levels(
     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     location: Optional[str] = Query(None),
@@ -1417,7 +1417,7 @@ async def get_floor_levels(
             detail="Failed to retrieve floor levels."
         )
 
-@router.get("/elasticsearch/zones")
+@router.get("/zones")
 async def get_zones(
     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
     floor_level: Optional[str] = Query(None),
@@ -1476,7 +1476,7 @@ async def get_zones(
             detail="Failed to retrieve zones."
         )
 
-@router.get("/elasticsearch/locations/analytics")
+@router.get("/locations/analytics")
 async def get_location_analytics(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
@@ -1536,7 +1536,7 @@ async def get_location_analytics(
             detail="Failed to retrieve location analytics."
         )
 
-@router.get("/elasticsearch/locations/summary")
+@router.get("/locations/summary")
 async def get_location_summary(
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1586,7 +1586,7 @@ async def get_location_summary(
             detail="Failed to retrieve location summary."
         )
 
-@router.get("/elasticsearch/locations/search")
+@router.get("/locations/search")
 async def search_location_data(
     search_term: str = Query(..., min_length=1, description="Search term"),
     search_fields: List[str] = Query(

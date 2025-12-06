@@ -1,6 +1,7 @@
 # app/services/user_service.py
 from typing import Dict, List, Optional, Tuple, Union, Any
 from passlib.context import CryptContext
+from app.services.postgres_service import postgres_service
 from app.services.database import db_manager
 import uuid
 from uuid import UUID 
@@ -505,12 +506,10 @@ class UserManager:
             # Step 4: Get all cameras owned by user (for Qdrant deletion)
             camera_workspace_mapping = await self._get_user_cameras_by_workspace(user_id)
             
-            # Step 5: Delete from Qdrant collections (if qdrant_service available)
             if camera_workspace_mapping:
                 try:
                       
-                    from app.services.unified_data_service import unified_data_service as qdrant_service
-                    qdrant_result = await qdrant_service.delete_user_camera_data(camera_workspace_mapping)
+                    qdrant_result = await postgres_service.delete_user_camera_data(camera_workspace_mapping)
                     deletion_results["qdrant_deletion"] = qdrant_result
                 except Exception as qdrant_err:
                     logger.error(f"Qdrant deletion failed for user {username}: {qdrant_err}")

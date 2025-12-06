@@ -25,7 +25,7 @@ from app.services.camera_service import camera_service
 from app.services.parameter_service import parameter_service
 from app.services.location_service import location_service
 from app.services.database import db_manager
-from app.services.qdrant_service import  qdrant_service
+from app.services.postgres_service import  postgres_service
 from app.utils import ensure_uuid_str, check_workspace_access, parse_string_or_list, encoded_string
 
 
@@ -76,7 +76,6 @@ async def create_stream(
         logger.error(f"Unexpected error creating stream: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred while creating stream.")
 
-
 @router.get("/source/user")
 async def get_user_streams(
     return_base64: bool = Query(True, description="Return static_base64 field (yes/no)"),
@@ -106,7 +105,6 @@ async def get_user_streams(
     except Exception as e:
         logger.error(f"Unexpected error retrieving streams: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred while retrieving streams.")
-
 
 @router.get("/source/users")
 async def get_all_streams(
@@ -186,7 +184,6 @@ async def get_all_streams(
         logger.error(f"Unexpected error retrieving all streams: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
-
 @router.put("/source", status_code=status.HTTP_200_OK)
 async def update_streams(
     streams: List[StreamUpdate],
@@ -249,7 +246,6 @@ async def update_streams(
         logger.error(f"Unexpected error in batch update: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred during stream updates.")
 
-
 @router.delete("/source", status_code=status.HTTP_200_OK)
 async def delete_streams(
     stream_ids_payload: StreamDelete,
@@ -310,7 +306,6 @@ async def delete_streams(
     except Exception as e:
         logger.error(f"Unexpected error in batch deletion: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred during stream deletion.")
-
 
 # ==================== Threshold Management ====================
 
@@ -375,7 +370,6 @@ async def update_stream_thresholds(
         logger.error(f"Error updating stream thresholds: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-
 @router.get("/{stream_id}/thresholds")
 async def get_stream_thresholds(
     stream_id: str,
@@ -423,21 +417,21 @@ async def get_stream_thresholds(
         logger.error(f"Error getting stream thresholds: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@router.get("/{stream_id}")
-async def get_stream_by_id(
-    stream_id: str,
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get details for a specific stream."""
-    try:
-        user_id_str = str(current_user_data["user_id"])
-        result = await camera_service.get_stream_by_id(stream_id, user_id_str)
-        return JSONResponse(content={"status": "success", "data": result})
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
-    except Exception as e:
-        logger.error(f"Error getting stream {stream_id}: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
+# @router.get("stream-by-id/{stream_id}")
+# async def get_stream_by_id(
+#     stream_id: str,
+#     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+# ):
+#     """Get details for a specific stream."""
+#     try:
+#         user_id_str = str(current_user_data["user_id"])
+#         result = await camera_service.get_stream_by_id(stream_id, user_id_str)
+#         return JSONResponse(content={"status": "success", "data": result})
+#     except HTTPException as e:
+#         return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
+#     except Exception as e:
+#         logger.error(f"Error getting stream {stream_id}: {e}", exc_info=True)
+#         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
 
 @router.get("/streams")
 async def get_all_workspace_streams_endpoint(
@@ -488,7 +482,6 @@ async def get_camera_state(
         logger.error(f"Unexpected error fetching camera state: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred fetching camera state.")
 
-
 @router.get("/user_info")
 async def get_current_user_info(
     current_user_data_dep: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -531,7 +524,7 @@ async def get_current_user_info(
         timestamp_range_result = {}
         if active_workspace_id_str:
             try:
-                timestamp_range_result = await qdrant_service.get_timestamp_range(
+                timestamp_range_result = await postgres_service.get_timestamp_range(
                     camera_ids=None,
                     workspace_id=active_workspace_id_str,
                     requesting_username=username,
@@ -567,7 +560,6 @@ async def get_current_user_info(
     except Exception as e:
         logger.error(f"Unexpected error retrieving user info: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error while retrieving user information.")
-
 
 # ==================== PARAMETER ENDPOINTS ====================
 
@@ -619,7 +611,6 @@ async def create_or_update_workspace_camera_params_post(
         logger.error(f"Unexpected error saving param_stream: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred while saving parameters.")
 
-
 @router.put("/param_stream/user", status_code=status.HTTP_201_CREATED)
 async def create_or_update_workspace_camera_params_put(
     params: CameraStreamQueryParams,
@@ -628,7 +619,6 @@ async def create_or_update_workspace_camera_params_put(
 ):
     """Create or update workspace camera parameters (PUT)."""
     return await create_or_update_workspace_camera_params_post(params, request, current_user_data)
-
 
 @router.get("/param_stream/user")
 async def get_active_workspace_params(
@@ -656,7 +646,6 @@ async def get_active_workspace_params(
     except Exception as e:
         logger.error(f"Unexpected error retrieving workspace params: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
-
 
 @router.delete("/param_stream/user", status_code=status.HTTP_200_OK)
 async def delete_workspace_params(
@@ -702,7 +691,6 @@ async def delete_workspace_params(
         logger.error(f"Unexpected error deleting workspace parameters: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
-
 @router.get("/param_stream/users")
 async def get_all_workspace_params(
     current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -719,7 +707,6 @@ async def get_all_workspace_params(
     except Exception as e:
         logger.error(f"Unexpected error retrieving all workspace params: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
-
 
 @router.put("/param_stream/users", status_code=status.HTTP_200_OK)
 async def update_all_workspace_params(
@@ -777,7 +764,6 @@ async def update_all_workspace_params(
         logger.error(f"Unexpected error in batch update: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred during batch update.")
 
-
 @router.delete("/param_stream/users", status_code=status.HTTP_200_OK)
 async def delete_all_workspaces_params(
     request: Request,
@@ -809,7 +795,6 @@ async def delete_all_workspaces_params(
     except Exception as e:
         logger.error(f"Unexpected error deleting all workspace params: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
-
 
 @router.get("/param_stream/workspace/status")
 async def get_workspace_param_sync_status(
@@ -844,7 +829,6 @@ async def get_workspace_param_sync_status(
     except Exception as e:
         logger.error(f"Unexpected error getting workspace param status: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to get workspace parameter status.")
-
 
 # ==================== LOCATION ENDPOINTS ====================
 
@@ -883,7 +867,6 @@ async def get_location_hierarchy(
     except Exception as e:
         logger.error(f"Error getting location hierarchy: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve location hierarchy.")
-
 
 @router.get("/locations/stats", response_model=List[LocationStatsResponseWithAlerts])
 async def get_location_statistics(
@@ -964,7 +947,6 @@ async def get_location_statistics(
         logger.error(f"Error getting location statistics: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve location statistics.")
 
-
 @router.get("/locations/list")
 async def get_locations(
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1016,7 +998,6 @@ async def get_locations(
     except Exception as e:
         logger.error(f"Error getting locations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve locations.")
-
 
 @router.get("/areas/list")
 async def get_areas(
@@ -1131,7 +1112,6 @@ async def get_buildings(
         logger.error(f"Error getting buildings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve buildings.")
 
-
 @router.get("/floor-levels/list")
 async def get_floor_levels(
     buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
@@ -1176,7 +1156,6 @@ async def get_floor_levels(
         logger.error(f"Error getting floor levels: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve floor levels.")
 
-
 @router.get("/zones/list")
 async def get_zones(
     floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
@@ -1220,7 +1199,6 @@ async def get_zones(
     except Exception as e:
         logger.error(f"Error getting zones: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve zones.")
-
 
 @router.get("/cameras/by-location")
 async def get_cameras_by_location(
@@ -1368,7 +1346,6 @@ async def update_camera_alert_settings(
         logger.error(f"Error updating camera alert settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to update camera alert settings.")
 
-
 @router.get("/cameras/alert-summary")
 async def get_alert_summary(
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1446,7 +1423,6 @@ async def get_alert_summary(
         logger.error(f"Error getting alert summary: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve alert summary.")
 
-
 @router.put("/cameras/bulk-location-assignment", response_model=BulkLocationAssignmentResult)
 async def bulk_assign_camera_locations(
     assignment_data: BulkLocationAssignment,
@@ -1503,7 +1479,6 @@ async def bulk_assign_camera_locations(
         logger.error(f"Error in bulk location assignment: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to perform bulk location assignment.")
 
-
 # ==================== BULK UPLOAD ENDPOINTS ====================
 
 @router.get("/source/bulk-upload-with-location/template")
@@ -1524,7 +1499,6 @@ Server Room Camera,rtsp://192.168.1.103/stream,rtsp,active,true,Server Room,IT W
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=camera_upload_template_with_location_and_alerts.csv"}
     )
-
 
 @router.post("/source/bulk-upload-with-location", status_code=status.HTTP_200_OK)
 async def bulk_upload_cameras_with_location(
@@ -1748,7 +1722,6 @@ async def bulk_upload_cameras_with_location(
         logger.error(f"Error in bulk upload: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to perform bulk upload.")
 
-
 # ==================== CAMERA LIMIT MANAGEMENT ENDPOINTS ====================
 
 @router.put("/admin/user-camera-limit", status_code=status.HTTP_200_OK)
@@ -1874,7 +1847,6 @@ async def update_user_camera_limit(
             status_code=500,
             detail="An unexpected error occurred while updating camera limit."
         )
-
 
 @router.put("/admin/batch-user-camera-limit", status_code=status.HTTP_200_OK)
 async def batch_update_user_camera_limits(
@@ -2023,7 +1995,6 @@ async def batch_update_user_camera_limits(
             detail="An unexpected error occurred during batch update."
         )
 
-
 @router.get("/admin/user-camera-limit/{user_id}", status_code=status.HTTP_200_OK)
 async def get_user_camera_limit(
     user_id: str,
@@ -2135,7 +2106,6 @@ async def get_user_camera_limit(
             status_code=500,
             detail="An unexpected error occurred while retrieving camera limit."
         )
-
 
 @router.get("/admin/all-users-camera-limits", status_code=status.HTTP_200_OK)
 async def get_all_users_camera_limits(
@@ -2296,7 +2266,6 @@ async def get_all_users_camera_limits(
             status_code=500,
             detail="An unexpected error occurred while retrieving camera limits."
         )
-
 
 @router.get("/user/my-camera-limit", status_code=status.HTTP_200_OK)
 async def get_my_camera_limit(

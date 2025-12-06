@@ -249,4 +249,55 @@ class FireDetectionService:
             "last_detection_time": result.get("last_detection_time")
         }
 
+    async def load_fire_state_on_stream_start(self, stream_id: UUID) -> Dict[str, Any]:
+        """Load persistent fire state when stream starts - returns state info for stream manager"""
+        stream_id_str = str(stream_id)
+        try:
+            # Load from database
+            persistent_state = await self.get_fire_detection_state(stream_id)
+            
+            # Calculate cooldown info
+            cooldown_info = {
+                'fire_status': persistent_state['fire_status'],
+                'should_restore_cooldown': False,
+                'cooldown_remaining': 0,
+                'last_notification_timestamp': None
+            }
+            
+            if persistent_state['last_notification_time']:
+                last_notification_timestamp = persistent_state['last_notification_time'].timestamp()
+                import time
+                current_time = time.time()
+                time_since_last = current_time - last_notification_timestamp
+                
+                # Check if within cooldown period (5 minutes = 300 seconds)
+                fire_cooldown_duration = 300.0
+                if time_since_last < fire_cooldown_duration:
+                    cooldown_info['should_restore_cooldown'] = True
+                    cooldown_info['cooldown_remaining'] = fire_cooldown_duration - time_since_last
+                    cooldown_info['last_notification_timestamp'] = last_notification_timestamp
+                    
+                    logger.info(f"Fire cooldown should be restored for {stream_id_str}: "
+                            f"fire_status='{persistent_state['fire_status']}', "
+                            f"cooldown_remaining={cooldown_info['cooldown_remaining']/60:.1f}min")
+                else:
+                    logger.info(f"Fire state loaded for {stream_id_str}: "
+                            f"fire_status='{persistent_state['fire_status']}', "
+                            f"cooldown_expired")
+            else:
+                logger.info(f"Fire state loaded for {stream_id_str}: "
+                        f"fire_status='{persistent_state['fire_status']}', "
+                        f"no_previous_notifications")
+            
+            return cooldown_info
+            
+        except Exception as e:
+            logger.error(f"Error loading fire state for {stream_id}: {e}")
+            return {
+                'fire_status': 'no detection',
+                'should_restore_cooldown': False,
+                'cooldown_remaining': 0,
+                'last_notification_timestamp': None
+            }
+
 fire_detection_service = FireDetectionService()
