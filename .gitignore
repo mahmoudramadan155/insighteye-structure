@@ -1,7 +1,4 @@
 *.pdf
-*.png
-*.jpg
-*.jpeg
 *.env
 
 data/
@@ -9,12 +6,9 @@ denoise/
 input/
 elasticsearch_data/
 model_cache/
-models/
-models/*
 nemo_msdd_configs/
 uploads/
 versions/
-videos/
 volumes/
 chromadb/
 .pytest_cache/
@@ -26,7 +20,6 @@ qdrant_storage/*
 postgres_data/
 postgres_data/*
 insighteye/
-
 
 scripts/
 users_for_testing.txt
