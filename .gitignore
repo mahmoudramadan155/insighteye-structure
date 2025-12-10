@@ -1,8 +1,5 @@
 *.pdf
 *.env
-*.pt
-
-
 
 data/
 denoise/
